@@ -1,0 +1,18 @@
+[package]
+name = "openkontakt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Clean-room reader for Kontakt .nki instruments with loose WAV samples"
+
+[dependencies]
+thiserror.workspace = true
+hound.workspace = true
+encoding_rs.workspace = true
+rustfft = "6"
+memmap2 = "0.9"
+
+[dev-dependencies]
+hound.workspace = true

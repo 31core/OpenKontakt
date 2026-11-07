@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/openkontakt", "crates/openkontakt-plugin"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["OpenKontakt contributors"]
+repository = "https://example.invalid/openkontakt"
+
+[workspace.dependencies]
+thiserror = "2"
+hound = "3.5"
+encoding_rs = "0.8"
+parking_lot = "0.12"
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"

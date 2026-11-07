@@ -1,0 +1,28 @@
+[package]
+name = "openkontakt-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "OpenKontakt sampler plugin (VST3, CLAP, standalone)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "openkontakt"
+path = "src/main.rs"
+
+[dependencies]
+openkontakt = { path = "../openkontakt" }
+nice-plug = { version = "0.4.2", features = ["editor", "vst3", "standalone", "unsafe_standalone_dpi_fix"] }
+nice-plug-egui = "0.6.0"
+egui.workspace = true
+parking_lot.workspace = true
+atomic_float = "1.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+arc-swap = "1.7"
+rtrb = "0.4"
+rfd = "0.17"
+rustfft = "6"
