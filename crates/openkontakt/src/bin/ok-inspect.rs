@@ -63,6 +63,29 @@ fn main() {
                     "none"
                 }
             );
+            // Round robin is *inferred*: see the note on `Group::round_robin`. Print the cycles
+            // this reader believes in, so a library that looks wrong can be checked by eye.
+            let mut grouped: std::collections::BTreeMap<Vec<u8>, Vec<(usize, String, u32)>> =
+                std::collections::BTreeMap::new();
+            for group in &instrument.groups {
+                if let Some((position, key)) = group.round_robin() {
+                    grouped.entry(key).or_default().push((
+                        group.index,
+                        group.name.clone(),
+                        position,
+                    ));
+                }
+            }
+            let cycles = grouped;
+            for members in cycles.into_values().filter(|members| members.len() > 1) {
+                let mut members = members;
+                members.sort_by_key(|(_, _, position)| *position);
+                let label: Vec<String> = members
+                    .iter()
+                    .map(|(index, name, position)| format!("{index}:{name}@{position}"))
+                    .collect();
+                println!("  round robin (inferred): {}", label.join("  "));
+            }
             for diagnostic in &instrument.diagnostics {
                 println!(
                     "  [{:?}] {}: {}",

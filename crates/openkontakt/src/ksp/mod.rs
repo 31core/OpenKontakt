@@ -1239,6 +1239,12 @@ impl<'a> Interp<'a> {
                 self.host.panel_height(height);
                 Ok(Value::Int(0))
             }
+            // The grid form: one row is 21 px tall, and the panel starts two pixels down.
+            "set_ui_height" => {
+                let rows = self.eval_arg(args, 0)? as f32;
+                self.host.panel_height(rows * 21.0 + 2.0);
+                Ok(Value::Int(0))
+            }
             "set_ui_width_px" | "make_perfview" | "watch_var" | "wait" | "change_vol"
             | "change_tune" | "fade_out" | "set_event_par_arr" | "message" | "exit" => {
                 if lower == "message" {
@@ -1294,6 +1300,28 @@ impl<'a> Interp<'a> {
                 ))
             }
             "_reset_rls_trig_counter" => Ok(Value::Int(0)),
+            // `search(array, value)` is the only way a script asks "is this in the list, and
+            // where". Returning 0 for it (as the unknown-function fallback did) makes a routing
+            // test like `search(%groups, $i) = -1` false for every group, which silences the
+            // whole instrument.
+            "search" => {
+                let name = match args.first() {
+                    // An array's name keeps its `%` (that is how it is stored), so this must not
+                    // go through `bare()`.
+                    Some(Expr::Var(_, name)) => name.clone(),
+                    _ => return Ok(Value::Int(-1)),
+                };
+                let value = self.eval_arg(args, 1)?;
+                let found = match self.vars.vars.get(&name) {
+                    Some(Variable::Array(values)) => values
+                        .iter()
+                        .position(|entry| entry.as_int() == value)
+                        .map(|index| index as i64)
+                        .unwrap_or(-1),
+                    _ => -1,
+                };
+                Ok(Value::Int(found))
+            }
             other => {
                 self.host
                     .diagnostic(format!("KSP: unsupported function `{other}` ignored"));
@@ -1935,6 +1963,44 @@ mod tests {
         fn engine_par_disp(&mut self, _p: &str, _g: i64, _s: i64, _x: i64) -> String {
             String::new()
         }
+    }
+
+    #[test]
+    fn search_reports_the_index_of_an_element() {
+        let text = r#"
+        on init
+          declare %groups[2] := (4, 5)
+          declare ui_slider $found(0, 10)
+          $found := search(%groups, 4)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        let value = runtime.controls(0)[0].value;
+        assert_eq!(value, 0, "4 is at index 0");
+
+        let text = r#"
+        on init
+          declare %groups[2] := (4, 5)
+          declare ui_slider $found(0, 10)
+          $found := search(%groups, 5)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        assert_eq!(runtime.controls(0)[0].value, 1);
+
+        let text = r#"
+        on init
+          declare %groups[2] := (4, 5)
+          declare ui_slider $found(0, 10)
+          $found := search(%groups, 0) + 5
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        // Not present: `search` returns -1, so -1 + 5 = 4.
+        assert_eq!(runtime.controls(0)[0].value, 4);
     }
 
     #[test]

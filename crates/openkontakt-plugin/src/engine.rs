@@ -2,11 +2,13 @@ use crate::fx;
 use crate::script_worker::{IrLoader, ScriptCommand, ScriptWorker};
 use crate::state::LoadedInstrument;
 use openkontakt::AudioSample;
+use openkontakt::Instrument;
 use openkontakt::dsp::Convolver;
 use openkontakt::effects::{self, ModuleParams};
 use openkontakt::envelope::{self, Ahdsr};
 use openkontakt::ksp::EventContext;
 use openkontakt::ksp::ScriptAction;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const MAX_VOICES: usize = 128;
@@ -207,6 +209,8 @@ pub struct Engine {
     /// Impulse response the program's convolution slot names, and its wet gain.
     rack_ir: Option<String>,
     rack_ir_gain: f32,
+    /// How many notes each round-robin cycle has played.
+    round_robin_counters: HashMap<Vec<u8>, u64>,
     send_block: usize,
     send_index: usize,
     send_in_l: Vec<f32>,
@@ -244,6 +248,7 @@ impl Default for Engine {
             filter_resonance: 0.0,
             conv: None,
             ir_loaded: None,
+            round_robin_counters: HashMap::new(),
             rack_ir: None,
             rack_ir_gain: 1.0,
             send_block: 512,
@@ -687,6 +692,47 @@ impl Engine {
     }
 
     /// Start every zone that matches, honouring the script's group routing when it set one.
+    /// Pick the round-robin group that plays this note, once per note-on.
+    ///
+    /// A cycle is every group whose start-criteria record is identical apart from the position
+    /// word. One group from each cycle plays; the rest stay silent until their turn.
+    ///
+    /// **The `0x38` reading behind this is inferred and unverified** — see `Group::round_robin`.
+    /// Two consequences worth knowing: a library is treated as round-robin only when at least two
+    /// of its groups share everything but that word, and `ok-inspect` lists the cycles it finds,
+    /// so a suspected misdetection can be confirmed without listening.
+    fn round_robin_choice(
+        &mut self,
+        instrument: &Instrument,
+        allowed: Option<&[bool]>,
+    ) -> HashMap<Vec<u8>, usize> {
+        let mut cycles: HashMap<Vec<u8>, Vec<(u32, usize)>> = HashMap::new();
+        for group in &instrument.groups {
+            // Only groups this event may play take part, and only they advance the cycle: a
+            // release-trigger `play_note` must not consume a round-robin slot.
+            if let Some(mask) = allowed {
+                if !mask.get(group.index).copied().unwrap_or(true) {
+                    continue;
+                }
+            }
+            if let Some((position, key)) = group.round_robin() {
+                cycles.entry(key).or_default().push((position, group.index));
+            }
+        }
+        let mut active = HashMap::new();
+        for (key, mut members) in cycles {
+            if members.len() < 2 {
+                continue;
+            }
+            members.sort_by_key(|(position, _)| *position);
+            let counter = self.round_robin_counters.entry(key.clone()).or_insert(0);
+            let chosen = members[(*counter as usize) % members.len()].1;
+            *counter = counter.wrapping_add(1);
+            active.insert(key, chosen);
+        }
+        active
+    }
+
     fn trigger(&mut self, key: u8, velocity_127: u8, allowed: Option<&[bool]>) {
         let Some(loaded) = self.current.clone() else {
             return;
@@ -701,6 +747,11 @@ impl Engine {
             return;
         }
         let any_solo = instrument.groups.iter().any(|group| group.soloed);
+
+        // Round-robin: groups that share a start-criteria record (apart from its position word)
+        // are alternatives for the same notes, and the reference plays one per note in turn.
+        // Playing all of them stacks the recordings, which sounds both louder and phased.
+        let active = self.round_robin_choice(instrument, allowed);
         for zone in &instrument.zones {
             if !zone.matches(key, velocity_127) {
                 continue;
@@ -715,6 +766,14 @@ impl Engine {
             };
             if group.muted || (any_solo && !group.soloed) {
                 continue;
+            }
+            if let Some((_, key)) = group.round_robin() {
+                if active
+                    .get(&key)
+                    .is_some_and(|wanted| *wanted != zone.group_index)
+                {
+                    continue;
+                }
             }
             let Some(sample_info) = zone.sample.as_ref() else {
                 continue;

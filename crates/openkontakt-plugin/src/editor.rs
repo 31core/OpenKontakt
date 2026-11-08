@@ -1310,15 +1310,27 @@ impl OpenKontaktEditor {
             let ui_width = loaded.map_or(632.0, |loaded| {
                 loaded.instrument.ksp_panel.ui_width_px.max(1.0)
             });
-            let ui_height = loaded.map_or(400.0, |loaded| {
-                loaded.instrument.ksp_panel.ui_height_px.max(1.0)
-            });
+            // The height a panel declares is often missing: `set_ui_height(4)` sizes it in grid
+            // rows and never reaches `ui_height_px`. Falling back to 1 px there clipped the
+            // wallpaper to a two-pixel strip, which reads as a black panel. When nothing is
+            // declared the picture itself is the panel, so its own aspect is the honest answer.
+            let declared_height =
+                loaded.map_or(0.0, |loaded| loaded.instrument.ksp_panel.ui_height_px);
+            let image_size = texture.size_vec2();
+            let ui_height = if declared_height > 0.0 {
+                declared_height
+            } else if image_size.x > 0.0 {
+                image_size.y * ui_width / image_size.x
+            } else {
+                loaded
+                    .and_then(|loaded| loaded.ksp.engine.panel_height())
+                    .unwrap_or(400.0)
+            };
             let scale = art.width() / ui_width;
             let panel = Rect::from_min_size(
                 art.min,
                 Vec2::new(art.width(), (ui_height * scale).min(art.height())),
             );
-            let image_size = texture.size_vec2();
             let image_height = image_size.y * scale;
             let image = Rect::from_min_size(
                 Pos2::new(art.min.x, panel.max.y - image_height),

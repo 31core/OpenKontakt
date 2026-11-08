@@ -31,6 +31,41 @@ pub struct Group {
     pub raw_public: Vec<u8>,
 }
 
+impl Group {
+    /// Round-robin position, when the `0x38` start-criteria record carries one.
+    ///
+    /// **This interpretation is inferred, not verified.** It comes from a single library
+    /// (Pianobook's Soft Steinway), whose two groups are byte-identical in `0x38` except for one
+    /// `u32` that reads 0 and 1 — matching the two recordings, and matching what a cycle needs. The field
+    /// could be something else that merely correlates with it (a solo flag, a voice slot), so an
+    /// instrument that sounds wrong after this change is more likely to be a wrong guess than a
+    /// wrong engine. Cross-check with `ok-inspect`, which prints the cycles it believes in:
+    ///
+    /// ```text
+    /// round robin (inferred): 0:RR1_tube@0  1:RR2_tube@1
+    /// ```
+    ///
+    /// A record of one byte (`00`) means "no criteria" and never cycles, which is the common case.
+    ///
+    /// Library: <https://www.pianobook.co.uk/packs/soft-steinway/>.
+    pub fn round_robin(&self) -> Option<(u32, Vec<u8>)> {
+        let body = self
+            .children
+            .iter()
+            .find(|child| child.id == 0x38)
+            .map(|child| child.body.as_slice())?;
+        if body.len() < 26 || body[0] != 1 {
+            return None;
+        }
+        let position = u32::from_le_bytes(body.get(22..26)?.try_into().ok()?);
+        // The position is what differs between the alternatives, so the cycle key is the record
+        // with that word zeroed.
+        let mut key = body.to_vec();
+        key.get_mut(22..26)?.fill(0);
+        Some((position, key))
+    }
+}
+
 const ACCEPTED_GROUP_VERSIONS: &[u16] = &[0x95, 0x96];
 
 /// Groups have no framing length in the list, so each object is parsed from the remaining slice
@@ -150,4 +185,59 @@ fn parse_group(reader: &mut Reader<'_>, index: usize) -> Result<Group> {
         children,
         raw_public: public.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group_with(record: Vec<u8>) -> Group {
+        Group {
+            index: 2,
+            version: 0x95,
+            flag: 0,
+            name: "RR4".into(),
+            volume: 1.0,
+            pan: 0.0,
+            tune: 1.0,
+            key_tracking: true,
+            reverse: false,
+            release_trigger: false,
+            release_trigger_note_monophonic: false,
+            rls_trig_counter: 0,
+            midi_channel: 0,
+            voice_group_index: -1,
+            fx_idx_amp_split_point: -1,
+            muted: false,
+            soloed: false,
+            interp_quality: 0,
+            public_tail: Vec::new(),
+            private: Vec::new(),
+            private_bus: None,
+            children: vec![OwnedChunk {
+                id: 0x38,
+                body: record,
+            }],
+            raw_public: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn round_robin_reads_the_position_word() {
+        let mut record = vec![0u8; 26];
+        record[0] = 1;
+        record[22..26].copy_from_slice(&3u32.to_le_bytes());
+        let (position, key) = group_with(record).round_robin().expect("a position word");
+        assert_eq!(position, 3);
+        assert_eq!(
+            &key[22..26],
+            &[0, 0, 0, 0],
+            "the cycle key ignores the position"
+        );
+
+        assert!(
+            group_with(vec![0]).round_robin().is_none(),
+            "a one-byte record carries no criteria"
+        );
+    }
 }

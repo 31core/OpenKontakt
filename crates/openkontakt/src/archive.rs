@@ -1,16 +1,25 @@
-//! Older libraries keep their UI artwork inside a resource archive (`.nkr`) instead of loose
-//! files under `Resources/pictures/`. This module reads that archive's *file table*, which is
-//! enough to get the picture sprite sheets and their `.txt` sidecars back.
+//! Libraries that do not ship loose `Resources/pictures/` files keep the same artwork inside a
+//! resource archive (`.nkr`). This module reads the archive's **file table** — enough to get the
+//! picture sprite sheets and their `.txt` sidecars back. Sample payloads are not read here.
 //!
-//! Two independent structures have to be read:
+//! Every payload is a block with a 22-byte header:
 //!
-//! * the **directory**, a flat prefix of UTF-16LE names in file order, and
-//! * the **payload blocks**, each introduced by a 22-byte header and stored back to back in the
-//!   same order as the directory.
+//! ```text
+//! fa 05 e9 2a | version | flags | .. len (u32 at +14) .. | payload
+//! ```
 //!
-//! The directory also carries a `u32` next to every name. It is *not* a payload offset — it does
-//! not match the block positions in a retail archive — so the pairing below never uses it and
-//! relies on the two lists sharing an order, which they do.
+//! Two directory layouts are in circulation:
+//!
+//! * **name list** — a flat prefix of UTF-16LE names in file order, blocks stored back to back in
+//!   that same order, and the `u32` beside each name *not* an offset. Pairing therefore has to rely
+//!   on the two lists sharing an order.
+//! * **directory** — every file row is `u16 length, u32 block offset, u16 kind, UTF-16LE name`, so
+//!   a name can be paired with the block it points at. These rows also carry folder names
+//!   (`Resources`, `pictures`, `scripts`, …) that have no block at all, which is why pairing by
+//!   order alone is not enough.
+//!
+//! The reader uses the offset when it points at a block and falls back to order otherwise, so both
+//! layouts parse. Two header versions exist (`0x110`, `0x111`) with an identical layout.
 
 /// One file recovered from a resource archive.
 #[derive(Clone, Debug)]
@@ -27,7 +36,9 @@ pub struct ResourceArchive {
 /// Header that introduces every stored payload: magic, a version word, a flags word, then a
 /// 16-bit gap and the payload length.
 const BLOCK_MAGIC: [u8; 4] = [0xfa, 0x05, 0xe9, 0x2a];
-const BLOCK_VERSION: [u8; 4] = [0x10, 0x01, 0x00, 0x00];
+/// Two generations of the same header are in circulation: `0x110` and `0x111`. The rest of the
+/// layout is identical, so only the leading byte differs.
+const BLOCK_VERSIONS: [[u8; 4]; 2] = [[0x10, 0x01, 0x00, 0x00], [0x11, 0x01, 0x00, 0x00]];
 const BLOCK_FLAGS: [u8; 4] = [0x00, 0x00, 0xff, 0x00];
 const BLOCK_HEADER: usize = 22;
 /// Payload length lives at this unaligned offset inside the block header.
@@ -103,18 +114,82 @@ fn is_picture_extension(extension: &str) -> bool {
 pub fn parse_resource_archive(bytes: &[u8]) -> ResourceArchive {
     let names = scan_names(bytes);
     let blocks = scan_blocks(bytes);
-    let mut entries = Vec::with_capacity(names.len().min(blocks.len()));
-    for (name, (offset, length)) in names.into_iter().zip(blocks) {
-        let end = offset + length;
-        if end > bytes.len() {
+
+    // Some archives store a *directory* rather than a bare name list: every file row carries the
+    // absolute offset of its block. Others (the newer ones) do not, and there the two lists share
+    // their order. Pairing by offset when the offset is there, and by order otherwise, reads both.
+    let mut used = vec![false; blocks.len()];
+    let mut pairs: Vec<(String, usize)> = Vec::new();
+    for name in names {
+        let offset = directory_offset(bytes, &name);
+        if let Some(offset) = offset.and_then(|want| {
+            blocks
+                .iter()
+                .enumerate()
+                .position(|(index, (payload, length))| {
+                    !used[index] && *payload == want + BLOCK_HEADER && *length > 0
+                })
+        }) {
+            used[offset] = true;
+            pairs.push((name, offset));
+        }
+    }
+    for name in scan_names(bytes) {
+        if pairs.iter().any(|(paired, _)| *paired == name) {
             continue;
         }
+        match used.iter().position(|used| !used) {
+            Some(index) => {
+                used[index] = true;
+                pairs.push((name, index));
+            }
+            None => break,
+        }
+    }
+
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (name, index) in pairs {
+        let (payload, length) = blocks[index];
         entries.push(ArchiveEntry {
             name,
-            data: bytes[offset..end].to_vec(),
+            data: bytes[payload..payload + length].to_vec(),
         });
     }
     ResourceArchive { entries }
+}
+
+/// If `name` is preceded by a `u32` that points at a payload block header, return it.
+fn directory_offset(bytes: &[u8], name: &str) -> Option<usize> {
+    let mut needle = Vec::with_capacity(name.len() * 2 + 2);
+    for unit in name.encode_utf16() {
+        needle.extend_from_slice(&unit.to_le_bytes());
+    }
+    needle.extend_from_slice(&[0, 0]);
+
+    let mut from = 0usize;
+    while let Some(position) = find_subslice(&bytes[from..], &needle) {
+        let at = from + position;
+        from = at + 1;
+        if at < 8 {
+            continue;
+        }
+        let value =
+            u32::from_le_bytes([bytes[at - 8], bytes[at - 7], bytes[at - 6], bytes[at - 5]]);
+        let offset = value as usize;
+        if offset + 4 <= bytes.len() && bytes[offset..offset + 4] == BLOCK_MAGIC {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Collect the file names at the head of the archive. They are the only UTF-16LE runs in the
@@ -181,7 +256,9 @@ fn find_block(bytes: &[u8], from: usize) -> Option<usize> {
     while offset + BLOCK_HEADER <= bytes.len() {
         let header = &bytes[offset..offset + BLOCK_HEADER];
         if header[0..4] == BLOCK_MAGIC
-            && header[4..8] == BLOCK_VERSION
+            && BLOCK_VERSIONS
+                .iter()
+                .any(|version| header[4..8] == version[..])
             && header[8..12] == BLOCK_FLAGS
         {
             return Some(offset);
@@ -199,7 +276,7 @@ mod tests {
     fn block(payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&BLOCK_MAGIC);
-        out.extend_from_slice(&BLOCK_VERSION);
+        out.extend_from_slice(&BLOCK_VERSIONS[0]);
         out.extend_from_slice(&BLOCK_FLAGS);
         out.extend_from_slice(&[0, 0]);
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());

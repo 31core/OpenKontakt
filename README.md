@@ -72,6 +72,11 @@ libraries:
   few samples), and impulse responses are loaded on a separate thread as well
 - Full `.wav` loading (PCM 8/16/24/32-bit and 32-bit float, mono/stereo), with the WAV header taking
   precedence over the zone's stored sample metadata
+- **`.nkr` resource archives** are read for artwork: the file table yields picture sprite sheets and
+  their `.txt` sidecars, in both layouts found in retail libraries — a bare name list with blocks in
+  the same order, and a directory whose rows carry the absolute offset of each block. A script's
+  `$INST_WALLPAPER_ID` picture resolves through this path when the library ships no loose
+  `Resources/pictures/` folder
 - Instrument wallpaper read from the `.nki`: Program terminal filename reference `F2` → v2
   `other` list / v3 flat table, with no bundled fallback artwork
 - Sampler engine with key/velocity ranges, root key, group and zone gain/pan/tune, loops, reverse,
@@ -83,8 +88,10 @@ libraries:
 The project deliberately refuses to guess. Undocumented paths are either preserved verbatim or
 marked with `unimplemented!()` / a clear diagnostic:
 
-- **NKX/NKR/NCW containers** — out of scope for this milestone. Archive-member sample paths are
-  reported as diagnostics and stay silent.
+- **Sample data inside NKX monoliths, NKR archives and NCW files** — out of scope for this
+  milestone. A sample that does not resolve to a loose `.wav` is reported as a diagnostic and stays
+  silent. `.nkr` is read for its *artwork* (see above); what is missing there is only the sample
+  payloads.
 - **Encrypted libraries** (`EncryptionItem.is_encrypted == 1`) — require the library key; loading
   fails explicitly.
 - **Legacy NKS containers** (Kontakt 1–4 `BPatchHeaderV42`) — the decompressed-length offset is not
@@ -134,7 +141,7 @@ nice_export_vst3!(OpenKontakt);
 Create macOS bundles with:
 
 ```bash
-./scripts/bundle_macos.sh      # release build, then target/bundled/*
+./scripts/bundle-macos.sh      # release build, then target/bundled/*
 ```
 
 The script writes `OpenKontakt.vst3`, `OpenKontakt.clap`, `OpenKontakt.app` (standalone), and copies
@@ -150,6 +157,12 @@ For Windows and Linux the standalone is a single executable, so only the VST3 ne
 Both write `OpenKontakt.vst3/Contents/<arch>/…` and copy the raw standalone binary next to it, then
 pack the VST3 into `target/OpenKontakt-<version>-linux-<arch>.tar.gz` /
 `target/OpenKontakt-<version>-windows-x86_64.zip`.
+
+`bundle-windows.sh` also cross-compiles from Linux: install `cargo-xwin` once
+(`cargo install cargo-xwin`), then run the same script. It builds against
+`x86_64-pc-windows-msvc` and reads the artifacts from
+`target/x86_64-pc-windows-msvc/<profile>/`.
+
 Accepting a `.nki` dropped or passed on the command line works the same on all platforms.
 
 ## Loading an instrument
@@ -190,12 +203,13 @@ cargo run -q -p openkontakt --bin ok-inspect -- "<library>/NFO Chamber Strings L
 | `crates/openkontakt/src/zone.rs` | ZoneList, loops, slices |
 | `crates/openkontakt/src/filename.rs` | FileNameTable v2/v3/legacy |
 | `crates/openkontakt/src/resolve.rs` | path resolution rules |
+| `crates/openkontakt/src/archive.rs` | `.nkr` file table (artwork) |
 | `crates/openkontakt/src/script.rs` | KSP slot parser |
 | `crates/openkontakt/src/ksp_ui.rs` | read-only KSP UI extraction |
 | `crates/openkontakt/src/wav.rs` | WAV loader |
 | `crates/openkontakt-plugin/src/engine.rs` | sampler engine |
 | `crates/openkontakt-plugin/src/editor.rs` | custom egui interface |
-| `crates/openkontakt/src/future.rs` | `unimplemented!()` stubs for NKX/NKR/NCW/KSP |
+| `crates/openkontakt/src/future.rs` | `unimplemented!()` stubs for out-of-scope containers |
 
 ## License
 
