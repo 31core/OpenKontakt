@@ -9,13 +9,19 @@
 //!
 //! ```text
 //! header   0x30 bytes   magic 0x3FE1107A, version 0x110
-//! root     kind u16, sub u16, version u32, childCount u32, nameLen u32, name, tail
-//! entries  nameLen u32, name, tail        (repeated to EOF)
+//! root     kind u16, sub u16, version u32, childCount u32, nameLen u32, name
+//! entries  tail, nameLen u32, name          (repeated to EOF)
 //! tail     offset u32, size u32, kind u16, flags u16, 0 u32, 0 u32   (20 bytes)
 //! ```
 //!
 //! `size` is the payload length for samples and zero for folders and pictures. The root's
 //! `childCount` counts immediate children only — the flat list that follows runs to EOF.
+//!
+//! A record's **tail comes before its name**, and the first entry's tail sits directly after the
+//! root's name. The file therefore ends on a name, with no trailing tail. Reading name-first shifts
+//! every entry by one without producing anything implausible; the offset then belongs to the next
+//! entry, which is only visible when a payload is compared with the name that claims it (8Dio's
+//! `1_Art_1.PNG` pointed at a text sidecar, and 0 of 520 names matched their payload).
 
 use crate::error::{Error, Result};
 
@@ -99,9 +105,8 @@ pub fn parse_nkc(bytes: &[u8]) -> Result<NkcIndex> {
 
     let sub = u16::from_le_bytes([bytes[0x32], bytes[0x33]]);
     // The root's name length sits after kind, sub, version and childCount.
-    let root_name = read_name(bytes, HEADER_LEN + 12)?;
-    let after_root = HEADER_LEN + 16 + root_name.len() * 2 + TAIL_LEN;
-    let entries = read_entries(bytes, after_root)?;
+    let (root_name, root_name_end) = read_name(bytes, HEADER_LEN + 12)?;
+    let entries = read_entries(bytes, root_name_end)?;
 
     Ok(NkcIndex {
         version,
@@ -112,7 +117,7 @@ pub fn parse_nkc(bytes: &[u8]) -> Result<NkcIndex> {
 }
 
 /// Read the `u32` length-prefixed UTF-16 name of a node or entry at `at`.
-fn read_name(bytes: &[u8], at: usize) -> Result<String> {
+fn read_name(bytes: &[u8], at: usize) -> Result<(String, usize)> {
     if at + 4 > bytes.len() {
         return Err(Error::malformed("NKC name", at, "truncated name length"));
     }
@@ -134,10 +139,12 @@ fn read_name(bytes: &[u8], at: usize) -> Result<String> {
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    Ok(String::from_utf16_lossy(&units))
+    // The end offset comes from the stored length, not from `String::len()`: a character outside
+    // the BMP is one `char` but two UTF-16 units, so measuring with the string length would make
+    // every following record start early.
+    Ok((String::from_utf16_lossy(&units), end))
 }
 
-/// Read one 20-byte tail: `offset, size, kind u16, flags u16, 0, 0`.
 fn read_tail(bytes: &[u8], at: usize) -> (u64, Option<u64>, u32) {
     let word = |index: usize| -> u32 {
         u32::from_le_bytes([
@@ -155,36 +162,22 @@ fn read_tail(bytes: &[u8], at: usize) -> (u64, Option<u64>, u32) {
 /// Walk the flat entry list; it runs to the end of the file.
 fn read_entries(bytes: &[u8], mut at: usize) -> Result<Vec<NkcEntry>> {
     let mut entries = Vec::new();
-    while at < bytes.len() {
-        let name = read_name(bytes, at)?;
-        let tail_at = at + 4 + name.len() * 2;
-        if tail_at + TAIL_LEN > bytes.len() {
-            // 8Dio's catalogue ends with a name and no tail: 20 bytes are missing from the file,
-            // but the name list is intact. Keep the entry so lookups by name still work; it just
-            // has no offset.
-            if tail_at == bytes.len() {
-                entries.push(NkcEntry {
-                    name,
-                    offset: 0,
-                    size: None,
-                    kind: 0,
-                });
-                break;
-            }
-            return Err(Error::malformed(
-                "NKC entry",
-                at,
-                "entry runs past the file",
-            ));
-        }
-        let (offset, size, kind) = read_tail(bytes, tail_at);
+    // A record is its 20-byte tail *followed by* its name. Reading the name first shifts every
+    // entry by one, so each offset then carries the next entry's name. That still parses cleanly
+    // and still yields plausible offsets, which is why it survived: nothing looks wrong until a
+    // payload is compared against the name that claims it. The tell was this parser's own note
+    // that 8Dio's catalogue "ends with a name and no tail" — with the tail first, a name is exactly
+    // how the file ends.
+    while at + TAIL_LEN <= bytes.len() {
+        let (offset, size, kind) = read_tail(bytes, at);
+        let (name, name_end) = read_name(bytes, at + TAIL_LEN)?;
         entries.push(NkcEntry {
             name,
             offset,
             size,
             kind,
         });
-        at = tail_at + TAIL_LEN;
+        at = name_end;
     }
     Ok(entries)
 }
@@ -222,10 +215,11 @@ mod tests {
         out.extend_from_slice(&1u32.to_le_bytes());
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         push_name(&mut out, "Resources");
-        push_tail(&mut out, 0, 0, 1);
+        // A record is its 20-byte tail followed by its name, so the first entry's tail sits
+        // directly after the root's name and the file ends on a name.
         for (name, offset, size) in entries {
-            push_name(&mut out, name);
             push_tail(&mut out, *offset, *size, 4);
+            push_name(&mut out, name);
         }
         out
     }

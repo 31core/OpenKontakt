@@ -28,6 +28,7 @@ pub mod group;
 pub mod instrument;
 pub mod ksp;
 pub mod ksp_ui;
+pub mod ncw;
 pub mod nis;
 pub mod nkc;
 pub mod program;
@@ -40,12 +41,13 @@ pub mod zone;
 pub use envelope::Ahdsr;
 pub use error::{Error, Result};
 pub use instrument::{
-    Diagnostic, DiagnosticSeverity, Instrument, InstrumentStats, LoadedSamples, load_samples,
+    Diagnostic, DiagnosticSeverity, Instrument, InstrumentStats, LoadedSamples, OtherResource,
+    load_samples,
 };
 pub use ksp::{EngineState, KspRuntime, UiControl};
 pub use ksp_ui::{KspControl, KspControlKind, KspPanel};
 pub use program::ProgramParams;
-pub use wav::AudioSample;
+pub use wav::{AudioSample, SampleCursor};
 
 /// Version of the core reader.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

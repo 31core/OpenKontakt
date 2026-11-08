@@ -85,6 +85,15 @@ pub fn render(
     // The plugin drives the interpreter on a worker thread; the blocking path exists for
     // determinism. Being able to render both ways is how a difference between the plugin and an
     // offline render gets attributed to the threading.
+    // Keep the memory figures before the loaded instrument moves into the engine.
+    let sample_count = loaded.samples.len();
+    let streaming_count = loaded
+        .samples
+        .values()
+        .filter(|sample| sample.is_streaming())
+        .count();
+    let loaded_bytes = loaded.bytes_loaded;
+    let mapped_bytes = loaded.bytes_mapped;
     let threaded = std::env::var("OPENKONTAKT_THREADED").is_ok();
     if threaded {
         engine.set_instrument(Some(Arc::new(loaded)));
@@ -100,6 +109,13 @@ pub fn render(
     if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() {
         let (ir, conv, send) = engine.reverb_debug();
         eprintln!("debug: rack_ir={ir:?} convolver={conv} send_level={send:.4}");
+        // Streaming is only worth anything if the samples are not decoded up front, so say
+        // plainly how much of each is held.
+        eprintln!(
+            "debug: samples={sample_count} streaming={streaming_count} loaded={:.2} MB mapped={:.2} MB",
+            loaded_bytes as f64 / (1024.0 * 1024.0),
+            mapped_bytes as f64 / (1024.0 * 1024.0)
+        );
     }
 
     let frames =

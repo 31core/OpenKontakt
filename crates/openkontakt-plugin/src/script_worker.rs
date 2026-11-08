@@ -118,12 +118,46 @@ fn dispatch(runtime: &KspRuntime, command: ScriptCommand) -> Dispatch {
     }
 }
 
+/// Where an impulse response has to be read from.
+///
+/// A packed library keeps its impulse responses inside the same `.nkr` as its artwork and names
+/// them `<container>.nkr/<path inside>`; the `.nkc` catalogue turns that path into an offset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IrSource {
+    File(String),
+    Packed {
+        container: std::path::PathBuf,
+        start: usize,
+        size: usize,
+    },
+}
+
+impl IrSource {
+    /// Describe an impulse response from an instrument's `other` reference.
+    pub fn from_other(resource: &openkontakt::OtherResource) -> Self {
+        match resource {
+            openkontakt::OtherResource::File(path) => {
+                IrSource::File(path.display().to_string())
+            }
+            openkontakt::OtherResource::Packed {
+                container,
+                start,
+                size,
+            } => IrSource::Packed {
+                container: container.clone(),
+                start: *start,
+                size: *size,
+            },
+        }
+    }
+}
+
 /// Loader for impulse responses, also off the audio thread.
 ///
 /// The request carries the rate the engine is running at: an impulse response recorded at a
 /// different rate has to be resampled, otherwise its tail is stretched or shortened by the ratio
 /// (a 44.1 kHz IR in a 48 kHz engine convolves as if it were ~9 % shorter than it is).
-pub type IrRequest = Option<(String, f32)>;
+pub type IrRequest = Option<(IrSource, f32)>;
 pub type IrResponse = Option<openkontakt::dsp::Convolver>;
 
 pub struct IrLoader {
@@ -138,8 +172,8 @@ impl IrLoader {
         std::thread::Builder::new()
             .name("openkontakt-ir".into())
             .spawn(move || {
-                while let Ok(Some((path, sample_rate))) = request_rx.recv() {
-                    let convolver = build(&path, block_size, sample_rate);
+                while let Ok(Some((source, sample_rate))) = request_rx.recv() {
+                    let convolver = build(&source, block_size, sample_rate);
                     if response_tx.send(convolver).is_err() {
                         break;
                     }
@@ -152,8 +186,8 @@ impl IrLoader {
         }
     }
 
-    pub fn request(&self, path: &str, sample_rate: f32) {
-        let _ = self.request.send(Some((path.to_string(), sample_rate)));
+    pub fn request(&self, source: &IrSource, sample_rate: f32) {
+        let _ = self.request.send(Some((source.clone(), sample_rate)));
     }
 
     pub fn poll(&self) -> Option<IrResponse> {
@@ -162,11 +196,30 @@ impl IrLoader {
 }
 
 pub(crate) fn build(
-    path: &str,
+    source: &IrSource,
     block_size: usize,
     target_rate: f32,
 ) -> Option<openkontakt::dsp::Convolver> {
-    let sample = openkontakt::wav::load_wav(std::path::Path::new(path)).ok()?;
+    // An impulse response is read once, so it is decoded whole: going through the streaming path
+    // would decode its blocks again on every frame.
+    let sample = match source {
+        IrSource::File(path) => {
+            let path = std::path::Path::new(path);
+            let is_ncw = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ncw"));
+            if is_ncw {
+                openkontakt::wav::load_ncw(path, usize::MAX).ok()?
+            } else {
+                openkontakt::wav::load_wav(path).ok()?
+            }
+        }
+        IrSource::Packed {
+            container,
+            start,
+            size,
+        } => openkontakt::wav::load_ncw_range(container, *start, *size).ok()?,
+    };
     let frames = sample.frames;
     if frames == 0 {
         return None;

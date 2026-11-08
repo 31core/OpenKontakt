@@ -1,7 +1,7 @@
 use crate::fx;
 use crate::script_worker::{IrLoader, ScriptCommand, ScriptWorker};
 use crate::state::LoadedInstrument;
-use openkontakt::AudioSample;
+use openkontakt::{AudioSample, SampleCursor};
 use openkontakt::Instrument;
 use openkontakt::dsp::Convolver;
 use openkontakt::effects::{self, ModuleParams};
@@ -132,7 +132,9 @@ impl Envelope {
 struct Voice {
     active: bool,
     note: u8,
-    sample: Arc<AudioSample>,
+    /// Reads the sample and caches the `.ncw` block it is playing, so the audio thread never
+    /// decodes the same block twice and never takes a lock.
+    sample: SampleCursor,
     position: f64,
     start_frame: f64,
     end_frame: f64,
@@ -156,7 +158,7 @@ impl Default for Voice {
         Self {
             active: false,
             note: 0,
-            sample: Arc::new(AudioSample::silent()),
+            sample: SampleCursor::new(Arc::new(AudioSample::silent())),
             position: 0.0,
             start_frame: 0.0,
             end_frame: 0.0,
@@ -205,9 +207,9 @@ pub struct Engine {
     filter_resonance: f32,
     /// Send path: the IRC effect convolves a copy of the mix with the loaded impulse response.
     conv: Option<Convolver>,
-    ir_loaded: Option<String>,
+    ir_loaded: Option<crate::script_worker::IrSource>,
     /// Impulse response the program's convolution slot names, and its wet gain.
-    rack_ir: Option<String>,
+    rack_ir: Option<crate::script_worker::IrSource>,
     rack_ir_gain: f32,
     /// How many notes each round-robin cycle has played.
     round_robin_counters: HashMap<Vec<u8>, u64>,
@@ -323,10 +325,12 @@ impl Engine {
         for rack in effects::program_racks(&loaded.instrument.program.children) {
             for slot in rack.slots.iter().flatten() {
                 if let ModuleParams::Convolution { ir_index } = effects::decode(slot) {
-                    if let Some(path) =
-                        ir_index.and_then(|index| loaded.instrument.other_path(index))
+                    // A packed library names its impulse responses inside the resource package,
+                    // so the reference is resolved through the catalogue as well as the disk.
+                    if let Some(resource) =
+                        ir_index.and_then(|index| loaded.instrument.other_resource(index))
                     {
-                        self.rack_ir = Some(path.display().to_string());
+                        self.rack_ir = Some(crate::script_worker::IrSource::from_other(&resource));
                         self.rack_ir_gain = slot.output_gain.clamp(0.0, 8.0);
                     }
                 }
@@ -414,7 +418,10 @@ impl Engine {
                     if let Ok(mut messages) = loaded.ksp.engine.messages.lock() {
                         messages.push(format!(
                             "IR loaded: {}",
-                            self.ir_loaded.as_deref().unwrap_or("?")
+                            self.ir_loaded
+                                .as_ref()
+                                .map(|source| format!("{source:?}"))
+                                .unwrap_or_else(|| "?".to_string())
                         ));
                     }
                 }
@@ -424,7 +431,10 @@ impl Engine {
             let Ok(guard) = loaded.ksp.engine.ir_request.lock() else {
                 return;
             };
-            guard.clone().or_else(|| self.rack_ir.clone())
+            guard
+                .as_ref()
+                .map(|path| crate::script_worker::IrSource::File(path.clone()))
+                .or_else(|| self.rack_ir.clone())
         };
         let request = request.filter(|path| Some(path) != self.ir_loaded.as_ref());
         if let Some(path) = request {
@@ -528,14 +538,14 @@ impl Engine {
     /// Build the program's impulse response on this thread. Offline renders must not wait for a
     /// loader thread: the result has to be identical on every run and available from sample zero.
     pub(crate) fn load_rack_ir_blocking(&mut self) {
-        let Some(path) = self.rack_ir.clone() else {
+        let Some(source) = self.rack_ir.clone() else {
             return;
         };
-        if Some(&path) == self.ir_loaded.as_ref() {
+        if Some(&source) == self.ir_loaded.as_ref() {
             return;
         }
-        self.conv = crate::script_worker::build(&path, self.send_block, self.sample_rate);
-        self.ir_loaded = Some(path);
+        self.conv = crate::script_worker::build(&source, self.send_block, self.sample_rate);
+        self.ir_loaded = Some(source);
     }
 
     /// Turn the convolution return off. Used by the differential harness to separate "our reverb is
@@ -556,6 +566,7 @@ impl Engine {
                 (
                     voice
                         .sample
+                        .sample()
                         .path
                         .file_name()
                         .map(|name| name.to_string_lossy().to_string())
@@ -576,7 +587,11 @@ impl Engine {
 
     /// Reverb wiring, for diagnostics.
     pub(crate) fn reverb_debug(&self) -> (Option<String>, bool, f32) {
-        (self.rack_ir.clone(), self.conv.is_some(), self.send_level)
+        (
+            self.rack_ir.as_ref().map(|source| format!("{source:?}")),
+            self.conv.is_some(),
+            self.send_level,
+        )
     }
 
     /// Offline variant of [`Engine::set_instrument`]: no script thread, so the interpreter runs on
@@ -853,7 +868,7 @@ impl Engine {
             self.start_voice(Voice {
                 active: true,
                 note: key,
-                sample,
+                sample: SampleCursor::new(sample),
                 position: if reverse {
                     (end_frame - 1.0).max(start_frame)
                 } else {
@@ -1175,6 +1190,7 @@ mod tests {
             samples: samples.samples,
             diagnostics: Vec::new(),
             bytes_loaded: 0,
+            bytes_mapped: 0,
             loaded_at: std::time::Instant::now(),
             elapsed_ms: 0,
         });

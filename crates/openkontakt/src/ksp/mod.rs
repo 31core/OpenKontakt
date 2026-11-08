@@ -1362,6 +1362,22 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Int(found))
             }
+            // `num_elements(array)` is how a script walks a group list. Without it every
+            // `while ($a < num_elements(%groups))` loop runs zero times, so a script that pairs
+            // `disallow_group($ALL_GROUPS)` with a loop of `allow_group(...)` allows nothing and
+            // the instrument plays silently. 8Dio's 1928 Piano is exactly that shape.
+            "num_elements" => {
+                let name = match args.first() {
+                    // An array's name keeps its `%`, as with `search`.
+                    Some(Expr::Var(_, name)) => name.clone(),
+                    _ => return Ok(Value::Int(0)),
+                };
+                let count = match self.vars.vars.get(&name) {
+                    Some(Variable::Array(values)) => values.len() as i64,
+                    _ => 0,
+                };
+                Ok(Value::Int(count))
+            }
             other => {
                 self.host
                     .diagnostic(format!("KSP: unsupported function `{other}` ignored"));
@@ -1663,6 +1679,23 @@ impl KspRuntime {
                         .diagnostics
                         .push(format!("KSP on ui_control({name}): {error}"));
                 }
+            }
+        }
+        // Re-running the handlers is how the engine mirrors saved knob positions, but a handler
+        // can also assign other saved variables as a side effect: 8Dio's articulation selectors
+        // set `$Current_Art`, and the last one to run wins, which left the instrument on
+        // articulation 24 instead of the saved 1 and playing nothing. Put the saved variables back.
+        for (name, values) in entries {
+            let Some(first) = values.first().copied() else {
+                continue;
+            };
+            let bare = name.trim_start_matches('$');
+            if values.len() > 1 {
+                for (n, value) in values.iter().enumerate() {
+                    interp.vars.set_index(bare, n as i64, Value::Int(*value));
+                }
+            } else {
+                interp.vars.set(bare, Value::Int(first));
             }
         }
         state.vars = interp.vars;
@@ -2027,6 +2060,97 @@ mod tests {
         fn engine_par_disp(&mut self, _p: &str, _g: i64, _s: i64, _x: i64) -> String {
             String::new()
         }
+    }
+
+    /// `num_elements` is how a script walks a group list. A missing implementation made every
+    /// `while ($a < num_elements(%groups))` loop run zero times, so a script that disallows all
+    /// groups and re-allows them in a loop allowed none of them and played silence.
+    #[test]
+    fn num_elements_counts_an_array() {
+        let text = r#"
+        on init
+          declare %groups[2] := (4, 84)
+          declare ui_slider $seen(0, 10000)
+          declare $a
+          $a := 0
+          while ($a < num_elements(%groups))
+            $seen := $seen * 100 + %groups[$a]
+            inc($a)
+          end while
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        assert_eq!(runtime.controls(0)[0].value, 4 * 100 + 84);
+    }
+
+    /// The same shape end to end: disallow everything, then re-allow a list read from an array.
+    #[test]
+    fn a_group_loop_that_uses_num_elements_allows_the_listed_groups() {
+        let text = r#"
+        on init
+          declare %groups[2] := (1, 3)
+          declare $a
+        end on
+        on note
+          disallow_group($ALL_GROUPS)
+          $a := 0
+          while ($a < num_elements(%groups))
+            allow_group(%groups[$a])
+            inc($a)
+          end while
+        end on
+        "#;
+        let groups: Vec<GroupInfo> = (0..4)
+            .map(|_| GroupInfo {
+                release_trigger: false,
+                envelope: None,
+            })
+            .collect();
+        let runtime = KspRuntime::compile_with_groups(&[Some(text.to_string())], "", groups);
+        runtime.initialize();
+        let dispatch = runtime.dispatch(
+            "note",
+            EventContext {
+                note: 60,
+                velocity: 100,
+                id: 1,
+                status: 1,
+            },
+        );
+        let mask = dispatch.allowed_groups.expect("the script routed groups");
+        assert_eq!(mask, vec![false, true, false, true]);
+    }
+
+    /// Restoring a saved instrument must not let a replayed `on ui_control` handler overwrite
+    /// another saved variable. 8Dio's articulation selectors all assign `$Current_Art`, so the
+    /// last handler to run left it on articulation 24 instead of the saved 1 and nothing played.
+    #[test]
+    fn a_replayed_handler_does_not_overwrite_a_saved_variable() {
+        let text = r#"
+        on init
+          declare $current
+          declare ui_menu $picker
+        end on
+        on ui_control($picker)
+          $current := 24
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        runtime.apply_persistent(
+            0,
+            &[
+                ("$current".to_string(), vec![1]),
+                ("$picker".to_string(), vec![1]),
+            ],
+        );
+        let state = runtime.slots[0].lock().unwrap();
+        assert_eq!(
+            state.vars.get("current").as_int(),
+            1,
+            "the saved value must survive the handler replay"
+        );
     }
 
     #[test]

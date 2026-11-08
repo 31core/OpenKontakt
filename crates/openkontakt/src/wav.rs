@@ -47,6 +47,18 @@ enum Backing {
         data_offset: usize,
         format: SampleFormat,
     },
+    /// Compressed audio decoded a block at a time, straight out of the mapping.
+    ///
+    /// `base..base + length` is the `.ncw` payload inside the map: the whole file for a loose
+    /// sample, a record slice for one packed in an `.nkx`/`.nkr`.
+    Ncw {
+        map: Arc<memmap2::Mmap>,
+        base: usize,
+        length: usize,
+        file: crate::ncw::NcwFile,
+        /// The file that holds the payload: the `.ncw` itself, or the container it is packed in.
+        source: PathBuf,
+    },
 }
 
 pub struct AudioSample {
@@ -73,6 +85,7 @@ impl std::fmt::Debug for AudioSample {
                 &match self.backing {
                     Backing::Owned(_) => "owned",
                     Backing::Mapped { .. } => "mapped",
+                    Backing::Ncw { .. } => "ncw",
                 },
             )
             .finish()
@@ -102,17 +115,56 @@ impl AudioSample {
         match &self.backing {
             Backing::Owned(data) => (data.len() * std::mem::size_of::<f32>()) as u64,
             Backing::Mapped { map, .. } => map.len() as u64,
+            Backing::Ncw { map, .. } => map.len() as u64,
         }
     }
 
+    /// True when the audio stays on disk and is decoded as it is read.
     pub fn is_streaming(&self) -> bool {
-        matches!(self.backing, Backing::Mapped { .. })
+        matches!(
+            self.backing,
+            Backing::Mapped { .. } | Backing::Ncw { .. }
+        )
+    }
+
+    /// The file this sample's bytes are mapped from, when they are mapped at all.
+    ///
+    /// Several packed samples share one container, so a caller summing `mapped_bytes` has to
+    /// deduplicate on this or it counts the same mapping once per sample.
+    pub fn mapped_source(&self) -> Option<&Path> {
+        match &self.backing {
+            Backing::Mapped { .. } => Some(self.path.as_path()),
+            Backing::Ncw { source, .. } => Some(source.as_path()),
+            Backing::Owned(_) => None,
+        }
+    }
+
+    /// Frames per decoded block, for callers that want to read ahead.
+    pub fn block_frames(&self) -> Option<usize> {
+        match &self.backing {
+            Backing::Ncw { .. } => Some(crate::ncw::FRAMES_PER_BLOCK),
+            _ => None,
+        }
     }
 
     #[inline]
     fn raw(&self, index: usize) -> f32 {
         match &self.backing {
             Backing::Owned(data) => data.get(index).copied().unwrap_or(0.0),
+            // Cold path only: decodes the whole block for one value. Playback goes through
+            // `SampleCursor`, which caches the block it is playing.
+            Backing::Ncw { .. } => {
+                let stride = crate::ncw::FRAMES_PER_BLOCK;
+                let channels = self.channels.max(1) as usize;
+                let frame = index / channels;
+                let Some(decoded) = self.ncw_block(frame / stride) else {
+                    return 0.0;
+                };
+                decoded
+                    .get((frame % stride) * channels + index % channels)
+                    .copied()
+                    .unwrap_or(0.0)
+            }
             Backing::Mapped {
                 map,
                 data_offset,
@@ -165,35 +217,36 @@ impl AudioSample {
         }
     }
 
+    /// Decode one `.ncw` block, or `None` when this sample is not compressed.
+    fn ncw_block(&self, block: usize) -> Option<Vec<f32>> {
+        let Backing::Ncw {
+            map,
+            base,
+            length,
+            file,
+            ..
+        } = &self.backing
+        else {
+            return None;
+        };
+        let mut decoded =
+            Vec::with_capacity(crate::ncw::FRAMES_PER_BLOCK * self.channels.max(1) as usize);
+        file.decode_block(&map[*base..*base + *length], block, &mut decoded)
+            .ok()?;
+        Some(decoded)
+    }
+
     /// Read a frame at a fractional position with an 8-tap windowed-sinc kernel.
     ///
     /// Linear interpolation is not good enough here: pitch-shifting by a non-integer ratio leaves
     /// images that fold back into the audible band. Measured against a reference implementation,
     /// linear interpolation put ~25 dB too much energy at 14–16 kHz — a clearly audible "grainy"
     /// top end — while the sample itself only has −35 dB there.
+    ///
+    /// For a `.ncw` this decodes the block of every tap, which is only appropriate for callers
+    /// that read a handful of positions. Playback uses [`SampleCursor`], which caches them.
     pub fn sample_at(&self, position: f64) -> (f32, f32) {
-        if self.frames == 0 {
-            return (0.0, 0.0);
-        }
-        let position = position.max(0.0);
-        let base = position.floor();
-        let index = base as isize;
-        let frac = position - base;
-        let weights = sinc_weights(frac);
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
-        for (tap, weight) in weights.iter().enumerate() {
-            // Taps run from `index - 3` to `index + 4`.
-            let offset = tap as isize - 3;
-            let at = index + offset;
-            if at < 0 || at as usize >= self.frames {
-                continue;
-            }
-            let (l, r) = self.frame(at as usize);
-            left += l * weight;
-            right += r * weight;
-        }
-        (left, right)
+        sinc_read(self.frames, position, |index| self.frame(index))
     }
 
     /// Linearly interpolate between two frames. `position` is in source frames.
@@ -208,6 +261,120 @@ impl AudioSample {
         let b = self.frame((index + 1).min(self.frames.saturating_sub(1)));
         (a.0 + (b.0 - a.0) * frac, a.1 + (b.1 - a.1) * frac)
     }
+}
+
+/// A playback cursor over one sample, with the decoded block cached.
+///
+/// A `.ncw` has to be decoded before it can be read, and the block a voice is playing stays the
+/// same for 512 frames. Caching it here keeps the audio thread free of locks and atomics: the
+/// cursor owns its cache, and a voice owns its cursor. Two blocks are kept because the 8-tap
+/// window straddles a boundary and a loop jump re-reads the block it just left.
+///
+/// Uncompressed samples cost nothing extra: the cursor forwards to the mapping, which needs no
+/// cache.
+pub struct SampleCursor {
+    sample: Arc<AudioSample>,
+    blocks: [Option<(usize, Vec<f32>)>; 2],
+    next: usize,
+}
+
+impl SampleCursor {
+    pub fn new(sample: Arc<AudioSample>) -> Self {
+        Self {
+            sample,
+            blocks: [None, None],
+            next: 0,
+        }
+    }
+
+    pub fn sample(&self) -> &Arc<AudioSample> {
+        &self.sample
+    }
+
+    pub fn frames(&self) -> usize {
+        self.sample.frames
+    }
+
+    /// Read one frame, decoding its block when it is not already cached.
+    pub fn frame(&mut self, index: usize) -> (f32, f32) {
+        let Some(stride) = self.sample.block_frames() else {
+            return self.sample.frame(index);
+        };
+        if index >= self.sample.frames {
+            return (0.0, 0.0);
+        }
+        let channels = self.sample.channels.max(1) as usize;
+        let block = index / stride;
+        let at = (index % stride) * channels;
+        let Some(data) = self.cached_block(block) else {
+            return (0.0, 0.0);
+        };
+        match channels {
+            1 => {
+                let value = data.get(at).copied().unwrap_or(0.0);
+                (value, value)
+            }
+            2 => (
+                data.get(at).copied().unwrap_or(0.0),
+                data.get(at + 1).copied().unwrap_or(0.0),
+            ),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// Read a frame at a fractional position, interpolating from cached blocks.
+    pub fn sample_at(&mut self, position: f64) -> (f32, f32) {
+        let frames = self.sample.frames;
+        sinc_read(frames, position, |index| self.frame(index))
+    }
+
+    fn cached_block(&mut self, block: usize) -> Option<&[f32]> {
+        let slot = self
+            .blocks
+            .iter()
+            .position(|slot| matches!(slot, Some((cached, _)) if *cached == block));
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                let decoded = self.sample.ncw_block(block)?;
+                let slot = self.next;
+                self.blocks[slot] = Some((block, decoded));
+                self.next = (self.next + 1) % self.blocks.len();
+                slot
+            }
+        };
+        self.blocks[slot].as_ref().map(|(_, data)| data.as_slice())
+    }
+}
+
+/// 8-tap windowed-sinc read. `read` supplies a frame, so the caller decides how to fetch it.
+fn sinc_read(
+    frames: usize,
+    position: f64,
+    mut read: impl FnMut(usize) -> (f32, f32),
+) -> (f32, f32) {
+    if frames == 0 {
+        return (0.0, 0.0);
+    }
+    let position = position.max(0.0);
+    let base = position.floor();
+    let index = base as isize;
+    let frac = position - base;
+    let weights = sinc_weights(frac);
+    let mut left = 0.0f32;
+    let mut right = 0.0f32;
+    for (tap, weight) in weights.iter().enumerate() {
+        // Taps run from `index - 3` to `index + 4`.
+        let offset = tap as isize - 3;
+        let at = index + offset;
+        if at < 0 || at as usize >= frames {
+            continue;
+        }
+        let (l, r) = read(at as usize);
+        left += l * weight;
+        right += r * weight;
+    }
+    (left, right)
 }
 
 /// Interpolation weights for the fractional part of a read position.
@@ -370,9 +537,12 @@ pub fn parse_wav_info(path: &Path) -> Result<(WavInfo, std::fs::File)> {
     ))
 }
 
-/// Map a sample file without reading it. `preload_frames` frames are touched so the first notes
-/// do not page-fault.
-pub fn map_wav(path: &Path, preload_frames: usize) -> Result<AudioSample> {
+/// Map a sample file without reading it.
+///
+/// `preload_bytes` is the amount of audio to touch up front so the first notes do not page-fault;
+/// it is the value the program stores, in bytes, converted to frames here because the frame size
+/// depends on the file's channel count and format.
+pub fn map_wav(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
     let (info, _file) = parse_wav_info(path)?;
     let file = std::fs::File::open(path).map_err(|error| Error::Io {
         path: path.to_path_buf(),
@@ -385,7 +555,8 @@ pub fn map_wav(path: &Path, preload_frames: usize) -> Result<AudioSample> {
         .map_err(|error| wav_error(path, format!("mmap failed: {error}")))?;
     let map = Arc::new(map);
 
-    let preload = preload_frames.min(info.frames);
+    let frame_bytes = (info.channels as usize).max(1) * info.format.bytes();
+    let preload = (preload_bytes / frame_bytes).min(info.frames);
     let mut peak = 0.0f32;
     let sample = AudioSample {
         path: path.to_path_buf(),
@@ -393,7 +564,9 @@ pub fn map_wav(path: &Path, preload_frames: usize) -> Result<AudioSample> {
         channels: info.channels,
         frames: info.frames,
         peak: 0.0,
-        resident_bytes: (preload * info.channels as usize * 4) as u64,
+        // Touching a mapped WAV brings the file's own bytes in as file-backed pages, so the
+        // resident cost is the source size, not an f32 copy.
+        resident_bytes: (preload * frame_bytes) as u64,
         backing: Backing::Mapped {
             map: Arc::clone(&map),
             data_offset: info.data_offset,
@@ -407,6 +580,177 @@ pub fn map_wav(path: &Path, preload_frames: usize) -> Result<AudioSample> {
     }
     let _ = &map;
     Ok(AudioSample { peak, ..sample })
+}
+
+/// Open a sample file, picking the decoder from the extension.
+///
+/// `.ncw` is NI's compressed container; everything else is treated as RIFF/WAVE.
+pub fn open_sample(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
+    let is_ncw = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncw"));
+    if is_ncw {
+        map_ncw(path, preload_bytes)
+    } else {
+        map_wav(path, preload_bytes)
+    }
+}
+
+/// Map a `.ncw` and decode it a block at a time.
+///
+/// The compressed bytes stay in the mapping: a packed library costs what the `.ncw` files take on
+/// disk, not four bytes per sample. `preload_frames` frames are decoded at load time so the first
+/// note does not wait for the first block and so `peak` means something.
+pub fn map_ncw(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
+    let file = std::fs::File::open(path).map_err(|error| Error::Io {
+        path: path.to_path_buf(),
+        source: error,
+    })?;
+    let map = map_file(path, file)?;
+    open_ncw_range(path, path.to_path_buf(), map, 0, None, preload_bytes)
+}
+
+/// Map a whole `.ncw` from bytes that are already in memory.
+///
+/// Used for packed samples: the record is a slice of an `.nkx`/`.nkr`, so the container is mapped
+/// and the payload range is handed in.
+pub fn map_ncw_range(
+    path: &Path,
+    container: &Path,
+    base: usize,
+    length: usize,
+    preload_bytes: usize,
+) -> Result<AudioSample> {
+    let file = std::fs::File::open(container).map_err(|error| Error::Io {
+        path: container.to_path_buf(),
+        source: error,
+    })?;
+    let map = map_file(container, file)?;
+    open_ncw_range(
+        path,
+        container.to_path_buf(),
+        map,
+        base,
+        Some(length),
+        preload_bytes,
+    )
+}
+
+fn map_file(path: &Path, file: std::fs::File) -> Result<Arc<memmap2::Mmap>> {
+    // SAFETY: the mapping is read-only and the file is not modified while it is mapped. A file
+    // truncated underneath the mapping would fault, which is why every read is bounds-checked.
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|error| wav_error(path, format!("mmap failed: {error}")))?;
+    Ok(Arc::new(map))
+}
+
+fn open_ncw_range(
+    path: &Path,
+    source: PathBuf,
+    map: Arc<memmap2::Mmap>,
+    base: usize,
+    length: Option<usize>,
+    preload_bytes: usize,
+) -> Result<AudioSample> {
+    let length = length.unwrap_or(map.len().saturating_sub(base));
+    let payload = map
+        .get(base..base + length)
+        .ok_or_else(|| wav_error(path, "NCW payload range is outside the file"))?;
+    let file = crate::ncw::NcwFile::parse(payload).map_err(|error| Error::Ncw {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let info = file.info();
+    // The preload budget is in bytes of source audio; a frame is `channels` samples of `bits`.
+    let frame_bytes = (info.channels as usize).max(1) * ((info.bits as usize).max(1) / 8);
+    let preload = (preload_bytes / frame_bytes.max(1)).min(file.frames());
+    let mut peak = 0.0f32;
+    let mut decoded = Vec::with_capacity(crate::ncw::FRAMES_PER_BLOCK * info.channels as usize);
+    let mut block = 0;
+    let mut reached = 0;
+    while reached < preload {
+        decoded.clear();
+        file.decode_block(payload, block, &mut decoded)
+            .map_err(|error| Error::Ncw {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        for value in decoded.iter() {
+            peak = peak.max(value.abs());
+        }
+        reached += file.block_frames(block);
+        block += 1;
+    }
+    Ok(AudioSample {
+        path: path.to_path_buf(),
+        sample_rate: info.sample_rate,
+        channels: info.channels,
+        frames: file.frames(),
+        peak,
+        resident_bytes: (decoded.len() * std::mem::size_of::<f32>()) as u64,
+        backing: Backing::Ncw {
+            map,
+            base,
+            length,
+            file,
+            source,
+        },
+    })
+}
+
+/// Read one `.ncw` record out of a container and decode it into memory.
+///
+/// Impulse responses are read once, end to end, so streaming them would decode every block twice.
+pub fn load_ncw_range(container: &Path, base: usize, length: usize) -> Result<AudioSample> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(container).map_err(|error| Error::Io {
+        path: container.to_path_buf(),
+        source: error,
+    })?;
+    file.seek(SeekFrom::Start(base as u64))
+        .map_err(|error| wav_error(container, error.to_string()))?;
+    let mut bytes = vec![0u8; length];
+    file.read_exact(&mut bytes)
+        .map_err(|error| wav_error(container, format!("truncated record: {error}")))?;
+    decode_ncw_bytes(container, &bytes, usize::MAX)
+}
+
+/// Decode a `.ncw` into memory. Kept for callers that want the samples up front.
+pub fn load_ncw(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
+    let bytes = std::fs::read(path).map_err(|error| Error::Io {
+        path: path.to_path_buf(),
+        source: error,
+    })?;
+    decode_ncw_bytes(path, &bytes, preload_bytes)
+}
+
+/// Decode `.ncw` bytes that came from somewhere other than a file.
+pub fn decode_ncw_bytes(path: &Path, bytes: &[u8], preload_bytes: usize) -> Result<AudioSample> {
+    let audio = crate::ncw::decode_ncw(bytes).map_err(|error| Error::Ncw {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    // `preload_bytes` of source audio, converted to interleaved values.
+    let bits = crate::ncw::parse_ncw_info(bytes)
+        .map(|info| info.bits as usize)
+        .unwrap_or(24);
+    let frame_bytes = (audio.channels as usize).max(1) * (bits.max(1) / 8).max(1);
+    let preload = (preload_bytes / frame_bytes)
+        .saturating_mul(audio.channels as usize)
+        .min(audio.samples.len());
+    let mut peak = 0.0f32;
+    for value in &audio.samples[..preload] {
+        peak = peak.max(value.abs());
+    }
+    Ok(AudioSample {
+        path: path.to_path_buf(),
+        sample_rate: audio.sample_rate,
+        channels: audio.channels,
+        frames: audio.frames,
+        peak,
+        resident_bytes: (audio.samples.len() * std::mem::size_of::<f32>()) as u64,
+        backing: Backing::Owned(audio.samples),
+    })
 }
 
 /// Decode a whole file into memory. Used for small files (impulse responses).
@@ -528,7 +872,7 @@ mod tests {
         assert!(owned.frame(1).0 < 0.001, "small positive must stay small");
         assert!(owned.frame(2).0 > -0.001, "small negative must stay small");
 
-        let mapped = map_wav(&path, 4).unwrap();
+        let mapped = map_wav(&path, 4_096).unwrap();
         for index in 0..values.len() {
             assert!((mapped.frame(index).0 - owned.frame(index).0).abs() < 1e-6);
         }
@@ -543,7 +887,7 @@ mod tests {
         write_wav(&path, 2, 48_000, &samples);
 
         let owned = load_wav(&path).unwrap();
-        let mapped = map_wav(&path, 16).unwrap();
+        let mapped = map_wav(&path, 4_096).unwrap();
         assert_eq!(owned.frames, mapped.frames);
         assert_eq!(owned.channels, mapped.channels);
         assert_eq!(owned.sample_rate, mapped.sample_rate);

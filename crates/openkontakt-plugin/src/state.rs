@@ -15,6 +15,8 @@ pub struct LoadedInstrument {
     pub samples: HashMap<i32, Arc<openkontakt::AudioSample>>,
     pub diagnostics: Vec<Diagnostic>,
     pub bytes_loaded: u64,
+    /// Bytes mapped from disk but not decoded: this is what a streaming sample costs.
+    pub bytes_mapped: u64,
     pub loaded_at: Instant,
     pub elapsed_ms: u128,
 }
@@ -110,6 +112,11 @@ pub fn load_instrument(path: &std::path::Path) -> Result<LoadedInstrument, openk
             envelope: openkontakt::envelope::group_amp_envelope(group),
         })
         .collect();
+    // Diagnostic switch: some instruments route every note through their own script, which makes
+    // it impossible to tell "the sample path is broken" from "the script is". Skipping the scripts
+    // plays the plain zone mapping instead.
+    let without_scripts = std::env::var("OPENKONTAKT_NO_SCRIPTS").is_ok();
+    let texts = if without_scripts { vec![None; texts.len()] } else { texts };
     let ksp = Arc::new(KspRuntime::compile_with_groups(&texts, &root, groups));
     ksp.initialize();
     for slot in &instrument.scripts {
@@ -138,6 +145,7 @@ pub fn load_instrument(path: &std::path::Path) -> Result<LoadedInstrument, openk
         samples: loaded.samples,
         diagnostics,
         bytes_loaded: loaded.bytes_loaded,
+        bytes_mapped: loaded.bytes_mapped,
         loaded_at: Instant::now(),
         elapsed_ms: started.elapsed().as_millis(),
     })

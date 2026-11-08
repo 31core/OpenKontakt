@@ -52,6 +52,9 @@ pub enum Error {
 
     #[error("WAV decode error for {path}: {message}")]
     Wav { path: PathBuf, message: String },
+
+    #[error("NCW decode error for {path}: {message}")]
+    Ncw { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
