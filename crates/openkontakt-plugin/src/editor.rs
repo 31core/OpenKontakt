@@ -32,6 +32,9 @@ const PANEL: Color32 = Color32::from_rgb(25, 25, 22);
 const PANEL_LIGHT: Color32 = Color32::from_rgb(32, 32, 28);
 const LINE: Color32 = Color32::from_rgb(55, 53, 46);
 const TEXT: Color32 = Color32::from_rgb(218, 213, 201);
+/// Largest texture side every GPU that runs a DAW is guaranteed to accept. egui panics above this,
+/// so oversized sprite sheets are scaled down before upload.
+const MAX_TEXTURE_SIDE: u32 = 16_000;
 const MUTED: Color32 = Color32::from_rgb(139, 133, 119);
 const DIM: Color32 = Color32::from_rgb(93, 89, 80);
 const ACCENT: Color32 = Color32::from_rgb(95, 163, 195);
@@ -98,6 +101,8 @@ pub struct OpenKontaktEditor {
     open_state: Option<OpenEditorState>,
     background: Option<TextureHandle>,
     background_source: Option<BackgroundSource>,
+    /// Height of the first page of a wallpaper that stacks several pages, in image pixels.
+    background_page: Option<u32>,
     /// Instrument header icon a script assigned to `$INST_ICON_ID`.
     header_icon: Option<TextureHandle>,
     header_icon_source: Option<String>,
@@ -148,6 +153,7 @@ impl OpenKontaktEditor {
             header_icon: None,
             header_icon_source: None,
             pictures: HashMap::new(),
+            background_page: None,
             pictures_root: None,
             show_file_menu: false,
             show_recent_menu: false,
@@ -262,6 +268,18 @@ impl OpenKontaktEditor {
             let Ok(image) = image::load_from_memory(&asset.image) else {
                 continue;
             };
+            // A sprite sheet taller than the GPU's maximum texture side is legal to ship and
+            // impossible to upload: 8Dio's `Long_Fader` is 12 × 32 967. Scaling the sheet keeps
+            // every proportion the panel uses, because frames are addressed as UV fractions.
+            let image = if image.width() > MAX_TEXTURE_SIDE || image.height() > MAX_TEXTURE_SIDE {
+                let scale =
+                    (MAX_TEXTURE_SIDE as f32 / image.width().max(image.height()) as f32).min(1.0);
+                let width = ((image.width() as f32 * scale).round() as u32).max(1);
+                let height = ((image.height() as f32 * scale).round() as u32).max(1);
+                image.resize_exact(width, height, image::imageops::FilterType::Triangle)
+            } else {
+                image
+            };
             let (frames, horizontal) = asset
                 .text
                 .as_deref()
@@ -327,6 +345,7 @@ impl OpenKontaktEditor {
             return;
         }
         self.background = None;
+        self.background_page = None;
         self.background_source = Some(desired.clone());
 
         if let Some(path) = &desired.file {
@@ -336,6 +355,16 @@ impl OpenKontaktEditor {
             let Ok(image) = image::load_from_memory(&bytes) else {
                 return;
             };
+            let image = if image.width() > MAX_TEXTURE_SIDE || image.height() > MAX_TEXTURE_SIDE {
+                let scale =
+                    (MAX_TEXTURE_SIDE as f32 / image.width().max(image.height()) as f32).min(1.0);
+                let width = ((image.width() as f32 * scale).round() as u32).max(1);
+                let height = ((image.height() as f32 * scale).round() as u32).max(1);
+                image.resize_exact(width, height, image::imageops::FilterType::Triangle)
+            } else {
+                image
+            };
+            self.background_page = page_height(&image);
             let rgba = image.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -1332,8 +1361,41 @@ impl OpenKontaktEditor {
                 Vec2::new(art.width(), (ui_height * scale).min(art.height())),
             );
             let image_height = image_size.y * scale;
+            // A wallpaper a little taller than the panel is the panel's own artwork with its
+            // edges bleeding over, and it is pinned to the bottom: that is what keeps the controls
+            // on the labels baked into the image (The Experience's Ambi panel is 633 × 329 in a
+            // 260 px view).
+            // A wallpaper that repeats its first rows is a sheet of stacked pages, and the panel
+            // shows one page centred on itself: 8Dio's page is 668 px tall for a 536 px view, so the
+            // view starts 66 px into the page. A wallpaper that is merely a little taller than the
+            // panel is the panel's own artwork with a few pixels of bleed and stays pinned to the
+            // bottom, which is what keeps The Experience's Ambi labels under their controls.
+            // `OPENKONTAKT_WALLPAPER_SHIFT` overrides the derived offset, so a value can be
+            // compared against the reference without rebuilding. Remove once the rule is settled.
+            let shift = match std::env::var("OPENKONTAKT_WALLPAPER_SHIFT")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+            {
+                Some(override_px) => override_px * scale,
+                None => match self
+                    .background_page
+                    .filter(|_| image_height > panel.height() * 1.5)
+                {
+                    // The page is centred in the panel: 8Dio's page is 668 px for a 536 px view,
+                    // which puts the visible band at 66..602 — the reference's alignment within a
+                    // couple of pixels.
+                    Some(page) => (((page as f32 - ui_height) / 2.0).max(0.0)) * scale,
+                    None => 0.0,
+                },
+            };
+            let page_sheet = shift > 0.0;
+            let image_top = if page_sheet {
+                panel.min.y - shift
+            } else {
+                panel.max.y - image_height
+            };
             let image = Rect::from_min_size(
-                Pos2::new(art.min.x, panel.max.y - image_height),
+                Pos2::new(art.min.x, image_top),
                 Vec2::new(image_size.x * scale, image_height),
             );
             painter.with_clip_rect(panel).image(
@@ -1554,7 +1616,7 @@ impl OpenKontaktEditor {
                     openkontakt::ksp::parser::UiKind::Switch => KspControlKind::Switch,
                     openkontakt::ksp::parser::UiKind::Button => KspControlKind::Button,
                     openkontakt::ksp::parser::UiKind::ValueEdit => KspControlKind::ValueEdit,
-                    openkontakt::ksp::parser::UiKind::Table => KspControlKind::Label,
+                    openkontakt::ksp::parser::UiKind::Table => KspControlKind::Table,
                 },
                 label: control.label.clone(),
                 x: control.x,
@@ -1574,6 +1636,8 @@ impl OpenKontaktEditor {
                 value_text: control.value_text.clone(),
                 pixel_width: control.pixel_width,
                 pixel_height: control.pixel_height,
+                table: control.table.clone(),
+                bar_color: control.bar_color,
             })
             .collect();
         let controls: &[KspControl] = if live.is_empty() {
@@ -1650,6 +1714,12 @@ impl OpenKontaktEditor {
                     continue;
                 }
                 let rect = control_rect(control);
+                // Controls the script has parked above the panel (a strip belonging to another
+                // page, or one moved to a negative position while hidden) must not spill over the
+                // header. Anything wholly outside the panel is skipped.
+                if !art.intersects(rect) {
+                    continue;
+                }
                 let value = self
                     .ksp_values
                     .iter()
@@ -1873,6 +1943,8 @@ impl OpenKontaktEditor {
                 value_text: control.value_text.clone(),
                 pixel_width: control.pixel_width,
                 pixel_height: control.pixel_height,
+                table: control.table.clone(),
+                bar_color: control.bar_color,
             },
         );
         let painter = p.ui.painter();
@@ -1987,6 +2059,42 @@ impl OpenKontaktEditor {
                     Align2::LEFT_CENTER,
                 );
             }
+            KspControlKind::Table => {
+                // Kontakt draws a table as a row of bars, one per step, filled from the bottom.
+                // The steps live in the array the control is bound to, not in a single value.
+                let steps = control.table.clone();
+                if steps.is_empty() {
+                    return;
+                }
+                let count = steps.len();
+                let peak = steps.iter().copied().max().unwrap_or(1).max(1) as f32;
+                let bar = cell.width() / count as f32;
+                let colour = control
+                    .bar_color
+                    .map(|value| {
+                        let red = (value & 0xff) as u8;
+                        let green = ((value >> 8) & 0xff) as u8;
+                        let blue = ((value >> 16) & 0xff) as u8;
+                        Color32::from_rgb(red, green, blue)
+                    })
+                    .unwrap_or(ACCENT);
+                for (index, step) in steps.iter().enumerate() {
+                    let level = (*step as f32 / peak).clamp(0.0, 1.0);
+                    if level <= 0.0 {
+                        continue;
+                    }
+                    let height = cell.height() * level;
+                    let x = cell.min.x + bar * index as f32;
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(x, cell.max.y - height),
+                            Vec2::new(bar * 0.85, height),
+                        ),
+                        0.0,
+                        colour,
+                    );
+                }
+            }
             KspControlKind::Knob | KspControlKind::ValueEdit => {
                 let cell_left = cell.min.x / p.scale - p.origin.x / p.scale;
                 let cell_top = cell.min.y / p.scale - p.origin.y / p.scale;
@@ -1994,7 +2102,12 @@ impl OpenKontaktEditor {
                     p.pos(cell_left + 24.0, cell_top + 24.0),
                     Vec2::splat(p.s(34.0)),
                 );
-                draw_ksp_knob(painter, p, knob_rect, value);
+                // A knob with `$CONTROL_PAR_PICTURE` is a sprite like any other control: the
+                // library ships the artwork and the script picked a frame per value. Drawing the
+                // generic knob over it was what left half the panel inconsistent.
+                if !self.draw_custom_picture(p, control, cell, value) {
+                    draw_ksp_knob(painter, p, knob_rect, value);
+                }
                 // Kontakt prints only what `set_knob_label` provides; a bare percentage is ours
                 // and would be wrong next to a value like "500.0 ms".
                 ksp_knob_caption(
@@ -3220,4 +3333,44 @@ mod tests {
         assert!(editor.background_source.is_none());
         assert!(editor.header_icon_source.is_none());
     }
+}
+
+/// Height of the first page of a wallpaper that stacks several pages.
+///
+/// A sheet of pages repeats its first rows at the page boundary, so the vertical period is the
+/// offset of the first later row that matches the top of the image. `None` for ordinary artwork.
+fn page_height(image: &image::DynamicImage) -> Option<u32> {
+    let rgba = image.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    if width == 0 || height < 64 {
+        return None;
+    }
+    let band = 4u32.min(height);
+    let row = |y: u32| -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(width as usize * 4);
+        for x in 0..width {
+            bytes.extend_from_slice(&rgba.get_pixel(x, y).0);
+        }
+        bytes
+    };
+    let top: Vec<Vec<u8>> = (0..band).map(row).collect();
+    for y in 32..height.saturating_sub(band) {
+        let mut matches = true;
+        for (offset, expected) in top.iter().enumerate() {
+            let candidate = row(y + offset as u32);
+            let difference: u32 = expected
+                .iter()
+                .zip(candidate.iter())
+                .map(|(a, b)| a.abs_diff(*b) as u32)
+                .sum();
+            if difference > (expected.len() as u32) * 6 {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return Some(y);
+        }
+    }
+    None
 }

@@ -112,43 +112,51 @@ fn is_picture_extension(extension: &str) -> bool {
 
 /// Parse a resource archive image.
 pub fn parse_resource_archive(bytes: &[u8]) -> ResourceArchive {
-    let names = scan_names(bytes);
+    // The directory lives in front of the first payload block, and an archive can be hundreds of
+    // megabytes (8Dio's `Resources.nkr` is 113 MB, mostly sample data). Every scan below is
+    // therefore bounded to that header region: searching the whole file once per name turned a
+    // load into a two-and-a-half minute freeze.
+    let header_end = find_block(bytes, 0).unwrap_or(bytes.len()).min(bytes.len());
+    let names = scan_names(bytes, header_end);
     let blocks = scan_blocks(bytes);
 
     // Some archives store a *directory* rather than a bare name list: every file row carries the
-    // absolute offset of its block. Others (the newer ones) do not, and there the two lists share
-    // their order. Pairing by offset when the offset is there, and by order otherwise, reads both.
+    // absolute offset of its block, which lets a name be paired with certainty. Others (the newer
+    // ones) do not, and there the two lists share their order. Both are handled: offset first,
+    // order for whatever is left.
     let mut used = vec![false; blocks.len()];
-    let mut pairs: Vec<(String, usize)> = Vec::new();
-    for name in names {
-        let offset = directory_offset(bytes, &name);
-        if let Some(offset) = offset.and_then(|want| {
-            blocks
-                .iter()
-                .enumerate()
-                .position(|(index, (payload, length))| {
-                    !used[index] && *payload == want + BLOCK_HEADER && *length > 0
-                })
-        }) {
-            used[offset] = true;
-            pairs.push((name, offset));
-        }
+    let mut pairs: Vec<(String, Option<usize>)> = Vec::with_capacity(names.len());
+    let mut by_payload: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (index, (payload, _)) in blocks.iter().enumerate() {
+        by_payload.entry(*payload).or_insert(index);
     }
-    for name in scan_names(bytes) {
-        if pairs.iter().any(|(paired, _)| *paired == name) {
+    for (name, offset) in names {
+        let index = offset
+            .and_then(|header| by_payload.get(&(header + BLOCK_HEADER)).copied())
+            .filter(|index| !used[*index] && blocks[*index].1 > 0);
+        if let Some(index) = index {
+            used[index] = true;
+        }
+        pairs.push((name, index));
+    }
+    for (name, index) in pairs.iter_mut() {
+        if index.is_some() {
             continue;
         }
         match used.iter().position(|used| !used) {
-            Some(index) => {
-                used[index] = true;
-                pairs.push((name, index));
+            Some(next) => {
+                used[next] = true;
+                *index = Some(next);
             }
-            None => break,
+            None => {
+                let _ = name;
+            }
         }
     }
 
     let mut entries = Vec::with_capacity(pairs.len());
     for (name, index) in pairs {
+        let Some(index) = index else { continue };
         let (payload, length) = blocks[index];
         entries.push(ArchiveEntry {
             name,
@@ -158,45 +166,11 @@ pub fn parse_resource_archive(bytes: &[u8]) -> ResourceArchive {
     ResourceArchive { entries }
 }
 
-/// If `name` is preceded by a `u32` that points at a payload block header, return it.
-fn directory_offset(bytes: &[u8], name: &str) -> Option<usize> {
-    let mut needle = Vec::with_capacity(name.len() * 2 + 2);
-    for unit in name.encode_utf16() {
-        needle.extend_from_slice(&unit.to_le_bytes());
-    }
-    needle.extend_from_slice(&[0, 0]);
-
-    let mut from = 0usize;
-    while let Some(position) = find_subslice(&bytes[from..], &needle) {
-        let at = from + position;
-        from = at + 1;
-        if at < 8 {
-            continue;
-        }
-        let value =
-            u32::from_le_bytes([bytes[at - 8], bytes[at - 7], bytes[at - 6], bytes[at - 5]]);
-        let offset = value as usize;
-        if offset + 4 <= bytes.len() && bytes[offset..offset + 4] == BLOCK_MAGIC {
-            return Some(offset);
-        }
-    }
-    None
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 /// Collect the file names at the head of the archive. They are the only UTF-16LE runs in the
 /// directory, which ends where the first payload block begins, so the scan is bounded there to
 /// keep compressed payload bytes from being mistaken for names.
-fn scan_names(bytes: &[u8]) -> Vec<String> {
-    let end = find_block(bytes, 0).unwrap_or(bytes.len()).min(bytes.len());
+fn scan_names(bytes: &[u8], end: usize) -> Vec<(String, Option<usize>)> {
+    let end = end.min(bytes.len());
     let mut names = Vec::new();
     let mut cursor = 0usize;
     while cursor + 4 <= end {
@@ -217,8 +191,23 @@ fn scan_names(bytes: &[u8]) -> Vec<String> {
         // A real name is terminated by a UTF-16 NUL and has an extension.
         let terminated = offset + 2 <= end && bytes[offset] == 0 && bytes[offset + 1] == 0;
         if text.len() >= 5 && terminated && text.contains('.') && !text.starts_with('.') {
-            names.push(text);
-            cursor = offset + 2;
+            // A directory row puts the block's absolute offset eight bytes before the name.
+            let at = cursor;
+            let block = if at >= 8 {
+                let value = u32::from_le_bytes([
+                    bytes[at - 8],
+                    bytes[at - 7],
+                    bytes[at - 6],
+                    bytes[at - 5],
+                ]) as usize;
+                (value + 4 <= bytes.len() && bytes[value..value + 4] == BLOCK_MAGIC)
+                    .then_some(value)
+            } else {
+                None
+            };
+            let advance = at + text.len() * 2 + 2;
+            names.push((text, block));
+            cursor = advance;
         } else {
             cursor += 1;
         }

@@ -399,18 +399,39 @@ impl Instrument {
     }
 
     /// Find the resource archive that belongs to this library, if there is one.
+    /// Find the library's resource archive.
+    ///
+    /// There is no single convention: some libraries keep `<instrument>.nkr` next to the `.nki`,
+    /// others put everything under `Resources/` (`Resources.nkr`) with the instruments in a
+    /// sibling folder. The archive is looked for in the library root, then one level down, then
+    /// beside the `.nki` itself.
     pub fn resource_archive_path(&self) -> Option<PathBuf> {
-        let entries = std::fs::read_dir(&self.library_root).ok()?;
-        let mut candidates: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| extension.eq_ignore_ascii_case("nkr"))
-                    .unwrap_or(false)
-            })
-            .collect();
+        let is_archive = |path: &Path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("nkr"))
+                .unwrap_or(false)
+        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for directory in [
+            Some(self.library_root.clone()),
+            Some(self.library_root.join("Resources")),
+            self.source_path.parent().map(Path::to_path_buf),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            candidates.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| is_archive(path)),
+            );
+        }
+        // Prefer an archive that is populated over one that is not, then the first by name.
         candidates.sort();
         candidates.into_iter().next()
     }

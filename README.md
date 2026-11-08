@@ -167,7 +167,7 @@ Accepting a `.nki` dropped or passed on the command line works the same on all p
 
 ## Loading an instrument
 
-- Click the **OPENKONTAKT** logo (or **FILE**) and choose **Load…**; this opens the native macOS file
+- Click the **OPENKONTAKT** logo and choose **Load…**; this opens the native macOS file
   chooser. The old in-window path field has been removed.
 - Or drag a `.nki` from Finder onto the window.
 - The standalone also accepts a path argument and the `OPENKONTAKT_INSTRUMENT` environment variable.

@@ -178,16 +178,21 @@ pub struct UiControl {
     /// explicitly; without them a 27×27 button is drawn as one 87×18 grid cell.
     pub pixel_width: Option<i32>,
     pub pixel_height: Option<i32>,
+    /// A `ui_table`'s steps, snapshotted from the array it is bound to.
+    pub table: Vec<i64>,
+    /// `$CONTROL_PAR_BAR_COLOR`, the colour a table draws its bars in.
+    pub bar_color: Option<i64>,
 }
 
 impl UiControl {
-    fn from_decl(decl: &UiDecl) -> Self {
+    fn from_decl(decl: &UiDecl, args: &[i64], len: Option<usize>) -> Self {
+        let _ = len;
         let (min, max) = match decl.kind {
             UiKind::Knob | UiKind::Slider | UiKind::ValueEdit => (
-                decl.args.first().copied().unwrap_or(0),
-                decl.args.get(1).copied().unwrap_or(1_000_000),
+                args.first().copied().unwrap_or(0),
+                args.get(1).copied().unwrap_or(1_000_000),
             ),
-            UiKind::Table => (0, decl.args.get(2).copied().unwrap_or(630_000)),
+            UiKind::Table => (0, args.get(2).copied().unwrap_or(630_000)),
             // `declare ui_button $x` takes no arguments; the control is a 0/1 switch. Without this
             // every write to it clamps to 0 and the button can never latch.
             UiKind::Button | UiKind::Switch => (0, 1),
@@ -205,11 +210,11 @@ impl UiControl {
             x: 0,
             y: 0,
             width: match decl.kind {
-                UiKind::Label | UiKind::Table => decl.args.first().copied().unwrap_or(1) as i32,
+                UiKind::Label | UiKind::Table => args.first().copied().unwrap_or(1) as i32,
                 _ => 1,
             },
             height: match decl.kind {
-                UiKind::Label | UiKind::Table => decl.args.get(1).copied().unwrap_or(1) as i32,
+                UiKind::Label | UiKind::Table => args.get(1).copied().unwrap_or(1) as i32,
                 _ => 1,
             },
             menu: Vec::new(),
@@ -218,6 +223,8 @@ impl UiControl {
             picture: None,
             pixel_width: None,
             pixel_height: None,
+            table: Vec::new(),
+            bar_color: None,
             mouse_behaviour: 0,
         }
     }
@@ -656,8 +663,10 @@ impl Host for EngineHost {
     }
 
     fn panel_height(&mut self, height: f32) {
+        // Each script states its own performance-view height; the panel is as tall as the tallest
+        // one. Keeping the last value let a one-row utility script shrink a 536 px panel to 23.
         if let Ok(mut value) = self.state.panel_height.lock() {
-            *value = Some(height);
+            *value = Some(value.map_or(height, |current| current.max(height)));
         }
     }
 
@@ -748,6 +757,8 @@ struct Interp<'a> {
     steps: u64,
     depth: usize,
     exit: bool,
+    /// Virtual script clock in milliseconds; `wait` advances it.
+    timer_ms: u64,
 }
 
 impl<'a> Interp<'a> {
@@ -760,6 +771,7 @@ impl<'a> Interp<'a> {
             steps: 0,
             depth: 0,
             exit: false,
+            timer_ms: 0,
         }
     }
 
@@ -810,10 +822,26 @@ impl<'a> Interp<'a> {
                 }
             }
             Stmt::DeclareUi(decl) => {
-                let control = UiControl::from_decl(decl);
+                let args: Vec<i64> = decl
+                    .args
+                    .iter()
+                    .map(|expr| self.eval(expr).map(|value| value.as_int()).unwrap_or(0))
+                    .collect();
+                let len = decl.len.as_ref().map(|expr| {
+                    self.eval(expr)
+                        .map(|value| value.as_int().max(0) as usize)
+                        .unwrap_or(0)
+                });
+                let control = UiControl::from_decl(decl, &args, len);
                 let name = control.name.clone();
-                if self.vars.get(&name) == Value::Int(0) && !self.vars.vars.contains_key(&name) {
-                    self.vars.declare(VarKind::Int, &name, decl.len);
+                // The control's own name is bare, but a `ui_table` is bound to an array whose
+                // name keeps its `%`, and that is the key the script writes to. Declaring it
+                // under the stripped name left every reference pointing at a different slot.
+                let variable = decl.name.clone();
+                if self.vars.get(&variable) == Value::Int(0)
+                    && !self.vars.vars.contains_key(&variable)
+                {
+                    self.vars.declare(VarKind::Int, &variable, len);
                 }
                 if let Some(existing) = self.ui.iter_mut().find(|c| c.name == name) {
                     *existing = control;
@@ -891,6 +919,9 @@ impl<'a> Interp<'a> {
             Expr::Str(value) => Value::Str(value.clone()),
             Expr::Var(kind, name) => match symbol(name) {
                 Some(Value::Int(value)) => Value::Int(value),
+                // The script clock. Panels read it to hold a readout for a moment and then clear
+                // it: `while ($KSP_TIMER < $deadline) wait(2000) end while`.
+                _ if name == "KSP_TIMER" => Value::Int(self.timer_ms as i64),
                 _ => match kind {
                     VarKind::Str => Value::Str(self.vars.get(name).as_str()),
                     _ => self.vars.get(name),
@@ -1169,6 +1200,7 @@ impl<'a> Interp<'a> {
                         "CONTROL_PAR_MOUSE_BEHAVIOUR" => control.mouse_behaviour = value as i32,
                         "CONTROL_PAR_WIDTH" => control.pixel_width = Some(value as i32),
                         "CONTROL_PAR_HEIGHT" => control.pixel_height = Some(value as i32),
+                        "CONTROL_PAR_BAR_COLOR" => control.bar_color = Some(value),
                         _ => {}
                     }
                 }
@@ -1245,12 +1277,20 @@ impl<'a> Interp<'a> {
                 self.host.panel_height(rows * 21.0 + 2.0);
                 Ok(Value::Int(0))
             }
-            "set_ui_width_px" | "make_perfview" | "watch_var" | "wait" | "change_vol"
-            | "change_tune" | "fade_out" | "set_event_par_arr" | "message" | "exit" => {
+            "set_ui_width_px" | "make_perfview" | "watch_var" | "change_vol" | "change_tune"
+            | "fade_out" | "set_event_par_arr" | "message" | "exit" => {
                 if lower == "message" {
                     let text = self.eval_arg_str(args, 0)?;
                     self.host.message(&text);
                 }
+                Ok(Value::Int(0))
+            }
+            // Suspending the script is how panels hold a readout on screen for a moment. The
+            // interpreter has no thread of its own here, so the clock advances instead of the
+            // world: the loop terminates, the handler finishes, and the readout clears at once.
+            "wait" => {
+                let ms = self.eval_arg(args, 0)?.max(0) as u64;
+                self.timer_ms = self.timer_ms.saturating_add(ms.max(1));
                 Ok(Value::Int(0))
             }
             "load_ir_sample" => {
@@ -1613,6 +1653,11 @@ impl KspRuntime {
                 .cloned()
                 .collect();
             for callback in callbacks {
+                // The budget guards a single handler against a runaway loop, so it has to start
+                // from zero for each one. Sharing the counter across every persisted control made
+                // a panel with a few hundred of them fail a third of the way through, with the
+                // error attributed to whichever handler happened to cross the line.
+                interp.steps = 0;
                 if let Err(error) = interp.run(&callback.body) {
                     state
                         .diagnostics
@@ -1906,12 +1951,31 @@ impl KspRuntime {
     }
 
     /// Snapshot of every slot's controls, for the GUI.
+    ///
+    /// A `ui_table` is bound to an array rather than to a single value, so its steps are copied in
+    /// here; without that the panel has nothing to draw bars from.
     pub fn controls(&self, index: usize) -> Vec<UiControl> {
-        self.slots
-            .get(index)
-            .and_then(|slot| slot.lock().ok())
-            .map(|state| state.ui.clone())
-            .unwrap_or_default()
+        let Some(slot) = self.slots.get(index) else {
+            return Vec::new();
+        };
+        let Ok(state) = slot.lock() else {
+            return Vec::new();
+        };
+        let mut controls = state.ui.clone();
+        for control in &mut controls {
+            if control.kind == UiKind::Table {
+                let array = format!("%{}", control.name);
+                let values = state
+                    .vars
+                    .vars
+                    .get(&array)
+                    .or_else(|| state.vars.vars.get(&control.name));
+                if let Some(crate::ksp::Variable::Array(values)) = values {
+                    control.table = values.iter().map(|value| value.as_int()).collect();
+                }
+            }
+        }
+        controls
     }
 
     pub fn diagnostics(&self) -> Vec<String> {
@@ -2001,6 +2065,30 @@ mod tests {
         runtime.initialize();
         // Not present: `search` returns -1, so -1 + 5 = 4.
         assert_eq!(runtime.controls(0)[0].value, 4);
+    }
+
+    #[test]
+    fn a_table_reads_the_array_it_is_bound_to() {
+        // `declare ui_table %Steps[n]` binds the array; the control's own name has no `%`, so a
+        // writer that used the stripped name would update a slot nothing reads.
+        let text = r#"
+        on init
+          declare const $steps := 4
+          declare ui_table %Steps[$steps](1, 1, 127)
+          %Steps[0] := 10
+          %Steps[1] := 20
+          %Steps[2] := 30
+          %Steps[3] := 40
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        let table = runtime
+            .controls(0)
+            .into_iter()
+            .find(|control| control.name == "Steps")
+            .expect("the table is a control");
+        assert_eq!(table.table, vec![10, 20, 30, 40]);
     }
 
     #[test]

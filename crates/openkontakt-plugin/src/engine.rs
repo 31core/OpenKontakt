@@ -697,7 +697,8 @@ impl Engine {
     /// A cycle is every group whose start-criteria record is identical apart from the position
     /// word. One group from each cycle plays; the rest stay silent until their turn.
     ///
-    /// **The `0x38` reading behind this is inferred and unverified** — see `Group::round_robin`.
+    /// **The `0x38` reading behind this is inferred** — see `Group::round_robin`. It holds for the
+    /// two libraries that use it; the multi-microphone case is what fixes the shape of the rule.
     /// Two consequences worth knowing: a library is treated as round-robin only when at least two
     /// of its groups share everything but that word, and `ok-inspect` lists the cycles it finds,
     /// so a suspected misdetection can be confirmed without listening.
@@ -705,7 +706,7 @@ impl Engine {
         &mut self,
         instrument: &Instrument,
         allowed: Option<&[bool]>,
-    ) -> HashMap<Vec<u8>, usize> {
+    ) -> HashMap<Vec<u8>, u32> {
         let mut cycles: HashMap<Vec<u8>, Vec<(u32, usize)>> = HashMap::new();
         for group in &instrument.groups {
             // Only groups this event may play take part, and only they advance the cycle: a
@@ -725,10 +726,20 @@ impl Engine {
                 continue;
             }
             members.sort_by_key(|(position, _)| *position);
+            // The cycle length is one past the highest position. Every group sharing the record
+            // plays when its own position comes round — *all* of them, not one: a multi-mic
+            // library puts each microphone's RR1 and RR2 in separate groups, and a note has to
+            // sound one variant of every microphone at once.
+            let length = members
+                .iter()
+                .map(|(position, _)| *position)
+                .max()
+                .unwrap_or(0)
+                + 1;
             let counter = self.round_robin_counters.entry(key.clone()).or_insert(0);
-            let chosen = members[(*counter as usize) % members.len()].1;
+            let wanted = (*counter % length as u64) as u32;
             *counter = counter.wrapping_add(1);
-            active.insert(key, chosen);
+            active.insert(key, wanted);
         }
         active
     }
@@ -749,8 +760,9 @@ impl Engine {
         let any_solo = instrument.groups.iter().any(|group| group.soloed);
 
         // Round-robin: groups that share a start-criteria record (apart from its position word)
-        // are alternatives for the same notes, and the reference plays one per note in turn.
-        // Playing all of them stacks the recordings, which sounds both louder and phased.
+        // form a cycle, and a group plays only when its position comes round. A multi-microphone
+        // library has several such cycles sharing one record, so this selects *every* matching
+        // group, not one: a note must sound one variant of each microphone at once.
         let active = self.round_robin_choice(instrument, allowed);
         for zone in &instrument.zones {
             if !zone.matches(key, velocity_127) {
@@ -767,11 +779,8 @@ impl Engine {
             if group.muted || (any_solo && !group.soloed) {
                 continue;
             }
-            if let Some((_, key)) = group.round_robin() {
-                if active
-                    .get(&key)
-                    .is_some_and(|wanted| *wanted != zone.group_index)
-                {
+            if let Some((position, key)) = group.round_robin() {
+                if active.get(&key).is_some_and(|wanted| *wanted != position) {
                     continue;
                 }
             }

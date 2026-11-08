@@ -70,9 +70,12 @@ pub enum UiKind {
 pub struct UiDecl {
     pub kind: UiKind,
     pub name: String,
-    /// `ui_table %steps[16](…)` declares a 16-element control.
-    pub len: Option<usize>,
-    pub args: Vec<i64>,
+    /// `ui_table %steps[16](…)` declares a 16-element control. The length is an expression, like
+    /// the arguments: `declare ui_table %Sequencer[$max_steps](…)`.
+    pub len: Option<Expr>,
+    /// Arguments as written. They are evaluated when the declaration runs, not when it is parsed:
+    /// retail scripts size a control with expressions like `($Lower_Limit - $KS_Max)`.
+    pub args: Vec<Expr>,
 }
 
 #[derive(Clone, Debug)]
@@ -462,10 +465,7 @@ impl Parser {
                     other => return Err(format!("expected control name, found {other:?}")),
                 };
                 let len = if self.eat("[") {
-                    let length = match self.next() {
-                        Tok::Int(value) => value.max(0) as usize,
-                        other => return Err(format!("expected table length, found {other:?}")),
-                    };
+                    let length = self.expr()?;
                     self.expect("]")?;
                     Some(length)
                 } else {
@@ -474,16 +474,7 @@ impl Parser {
                 let mut args = Vec::new();
                 if self.eat("(") {
                     while !matches!(self.peek(), Tok::Punct(")")) {
-                        match self.next() {
-                            Tok::Int(value) => args.push(value),
-                            Tok::Real(value) => args.push(value as i64),
-                            Tok::Punct("-") => {
-                                if let Tok::Int(value) = self.next() {
-                                    args.push(-value);
-                                }
-                            }
-                            _ => {}
-                        }
+                        args.push(self.expr()?);
                         if !self.eat(",") {
                             break;
                         }

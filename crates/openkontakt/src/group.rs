@@ -34,12 +34,10 @@ pub struct Group {
 impl Group {
     /// Round-robin position, when the `0x38` start-criteria record carries one.
     ///
-    /// **This interpretation is inferred, not verified.** It comes from a single library
-    /// (Pianobook's Soft Steinway), whose two groups are byte-identical in `0x38` except for one
-    /// `u32` that reads 0 and 1 — matching the two recordings, and matching what a cycle needs. The field
-    /// could be something else that merely correlates with it (a solo flag, a voice slot), so an
-    /// instrument that sounds wrong after this change is more likely to be a wrong guess than a
-    /// wrong engine. Cross-check with `ok-inspect`, which prints the cycles it believes in:
+    /// **This interpretation is inferred.** Two libraries agree on it, which is evidence rather
+    /// than proof: both put the position in the same `u32`, and nothing else in the record
+    /// differs. A third library that sounds wrong is more likely to be a wrong guess than a wrong
+    /// engine. Cross-check with `ok-inspect`, which prints the cycles it believes in:
     ///
     /// ```text
     /// round robin (inferred): 0:RR1_tube@0  1:RR2_tube@1
@@ -47,7 +45,8 @@ impl Group {
     ///
     /// A record of one byte (`00`) means "no criteria" and never cycles, which is the common case.
     ///
-    /// Library: <https://www.pianobook.co.uk/packs/soft-steinway/>.
+    /// Libraries: Pianobook's Soft Steinway (2 groups) and NFO's Chamber Strings (8 groups — four
+    /// microphones, each with an RR1 and an RR2 sharing one record).
     pub fn round_robin(&self) -> Option<(u32, Vec<u8>)> {
         let body = self
             .children

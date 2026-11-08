@@ -17,6 +17,8 @@ pub enum KspControlKind {
     Switch,
     Button,
     ValueEdit,
+    /// `ui_table`: a row of bars, one per element of the array it is bound to.
+    Table,
     Other,
 }
 
@@ -48,6 +50,10 @@ pub struct KspControl {
     /// `$CONTROL_PAR_WIDTH` / `$CONTROL_PAR_HEIGHT`: explicit pixel size, used by picture buttons.
     pub pixel_width: Option<i32>,
     pub pixel_height: Option<i32>,
+    /// A `ui_table`'s current values, one per step.
+    pub table: Vec<i64>,
+    /// `$CONTROL_PAR_BAR_COLOR`, the colour a table is drawn in.
+    pub bar_color: Option<i64>,
 }
 
 impl KspControl {
@@ -369,6 +375,8 @@ impl Builder {
             value_text: None,
             pixel_width: None,
             pixel_height: None,
+            table: Vec::new(),
+            bar_color: None,
         });
     }
 
