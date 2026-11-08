@@ -20,7 +20,6 @@ fn main() {
         loaded.bytes_loaded
     );
 
-    let stage = Instant::now();
     let archive_started = Instant::now();
     let archive = instrument.resource_archive();
     println!(

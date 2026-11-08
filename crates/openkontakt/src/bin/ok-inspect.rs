@@ -46,8 +46,10 @@ fn main() {
                 );
             }
             println!(
-                "  resolved sample files={} unresolved={}",
-                stats.resolved_sample_files, stats.unresolved_sample_files
+                "  resolved sample files={} packed={} unresolved={}",
+                stats.resolved_sample_files,
+                stats.packed_sample_files,
+                stats.unresolved_sample_files
             );
             if let Some(wallpaper) = &instrument.wallpaper_path {
                 println!("  wallpaper={}", wallpaper.display());
@@ -85,6 +87,30 @@ fn main() {
                     .map(|(index, name, position)| format!("{index}:{name}@{position}"))
                     .collect();
                 println!("  round robin (inferred): {}", label.join("  "));
+            }
+            if let Some(index) = instrument.nkc_index() {
+                // Group the catalogue by extension: a packed sample library and a resource-only
+                // catalogue look very different, and the counts say which one this is.
+                let mut kinds: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for entry in &index.entries {
+                    let extension = entry
+                        .name
+                        .rsplit_once('.')
+                        .map(|(_, tail)| tail.to_ascii_lowercase())
+                        .unwrap_or_else(|| "(none)".into());
+                    *kinds.entry(extension).or_default() += 1;
+                }
+                let kinds: Vec<String> = kinds
+                    .iter()
+                    .map(|(extension, count)| format!("{count} .{extension}"))
+                    .collect();
+                println!(
+                    "  nkc index: {} entries (sub 0x{:04X}, {})",
+                    index.entries.len(),
+                    index.sub,
+                    kinds.join(", ")
+                );
             }
             for diagnostic in &instrument.diagnostics {
                 println!(

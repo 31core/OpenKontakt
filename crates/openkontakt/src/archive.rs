@@ -111,6 +111,43 @@ fn is_picture_extension(extension: &str) -> bool {
 }
 
 /// Parse a resource archive image.
+/// Recover the archive by following a `.nkc` catalogue, which states where every payload starts.
+///
+/// This is the authoritative reading: the catalogue's offsets are the block offsets, so no
+/// heuristic about "directory order matches payload order" is involved. Returns `None` when the
+/// catalogue does not actually describe this container, so the caller can fall back.
+pub fn archive_from_index(bytes: &[u8], index: &crate::nkc::NkcIndex) -> Option<ResourceArchive> {
+    let mut entries = Vec::new();
+    for indexed in &index.entries {
+        let at = indexed.offset as usize;
+        if at + BLOCK_HEADER > bytes.len() {
+            continue;
+        }
+        if bytes[at..at + 4] != BLOCK_MAGIC {
+            continue;
+        }
+        let length = u32::from_le_bytes([
+            bytes[at + BLOCK_LENGTH_AT],
+            bytes[at + BLOCK_LENGTH_AT + 1],
+            bytes[at + BLOCK_LENGTH_AT + 2],
+            bytes[at + BLOCK_LENGTH_AT + 3],
+        ]) as usize;
+        let payload = at + BLOCK_HEADER;
+        if length == 0 || payload + length > bytes.len() {
+            continue;
+        }
+        entries.push(ArchiveEntry {
+            name: indexed.name.clone(),
+            data: bytes[payload..payload + length].to_vec(),
+        });
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(ResourceArchive { entries })
+    }
+}
+
 pub fn parse_resource_archive(bytes: &[u8]) -> ResourceArchive {
     // The directory lives in front of the first payload block, and an archive can be hundreds of
     // megabytes (8Dio's `Resources.nkr` is 113 MB, mostly sample data). Every scan below is

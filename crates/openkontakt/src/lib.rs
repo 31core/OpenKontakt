@@ -29,6 +29,7 @@ pub mod instrument;
 pub mod ksp;
 pub mod ksp_ui;
 pub mod nis;
+pub mod nkc;
 pub mod program;
 pub mod reader;
 pub mod resolve;

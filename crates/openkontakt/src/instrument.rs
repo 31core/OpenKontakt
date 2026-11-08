@@ -43,6 +43,9 @@ pub struct Instrument {
     pub library_root: PathBuf,
     pub sample_resolution: HashMap<i32, ResolutionDiagnostic>,
     pub resolved_samples: BTreeMap<i32, PathBuf>,
+    /// Samples that exist only inside a `.nkc` catalogue: the entry — and therefore the payload's
+    /// offset and length — is known, the `.ncw` codec is not.
+    pub packed_samples: HashMap<i32, crate::nkc::NkcEntry>,
     /// Wallpaper resolved from Program's terminal filename reference (F2).
     pub wallpaper_path: Option<PathBuf>,
     pub wallpaper_requested: Option<String>,
@@ -163,6 +166,11 @@ impl Instrument {
         let mut resolver = SampleResolver::new(&source_path);
         let mut sample_resolution = HashMap::new();
         let mut resolved_samples = BTreeMap::new();
+        // A packed library addresses its samples through a `.nkc` catalogue instead of keeping
+        // them on disk. Those are *found* — they just cannot be decoded yet, which is a different
+        // diagnosis from "this path does not exist".
+        let nkc = parse_nkc_index(&source_path, &resolver.library_root);
+        let mut packed_samples: HashMap<i32, crate::nkc::NkcEntry> = HashMap::new();
         if let Some(table) = &filename_table {
             for zone in &zones {
                 let Some(info) = &zone.sample else {
@@ -174,6 +182,18 @@ impl Instrument {
                 let resolved = resolver.resolve(table, info.filename_id);
                 if let Some(path) = resolved.path {
                     resolved_samples.insert(info.filename_id, path);
+                    continue;
+                }
+                let name = table
+                    .sample(info.filename_id)
+                    .and_then(|file| file.segments.iter().rev().find_map(|s| s.text.clone()));
+                let in_catalogue = nkc
+                    .as_ref()
+                    .zip(name.as_ref())
+                    .and_then(|(index, name)| index.get(name));
+                if let Some(entry) = in_catalogue {
+                    packed_samples.insert(info.filename_id, entry.clone());
+                    continue;
                 }
                 if let Some(diagnostic) = resolved.diagnostic {
                     sample_resolution.insert(info.filename_id, diagnostic);
@@ -189,6 +209,17 @@ impl Instrument {
             .values()
             .filter(|d| d.kind == crate::resolve::ResolutionDiagnosticKind::Missing)
             .count();
+        if !packed_samples.is_empty() {
+            diagnostics.push(Diagnostic {
+                severity: DiagnosticSeverity::Warning,
+                area: "samples",
+                message: format!(
+                    "{} sample(s) are indexed in the library's .nkc catalogue; NCW decoding is not \
+                     implemented, so those zones are silent",
+                    packed_samples.len()
+                ),
+            });
+        }
         if archive_count > 0 {
             diagnostics.push(Diagnostic {
                 severity: DiagnosticSeverity::Warning,
@@ -275,6 +306,7 @@ impl Instrument {
             library_root: resolver.library_root.clone(),
             sample_resolution,
             resolved_samples,
+            packed_samples,
             wallpaper_path,
             wallpaper_requested,
             resolved_other,
@@ -335,6 +367,7 @@ impl Instrument {
             zones_with_samples: with_samples,
             resolved_sample_files: self.resolved_samples.len(),
             unresolved_sample_files: self.sample_resolution.len(),
+            packed_sample_files: self.packed_samples.len(),
             scripts: self.scripts.iter().filter(|s| !s.is_empty()).count(),
             memory_bytes_total: self.program.params.sample_bytes_total,
         }
@@ -436,15 +469,97 @@ impl Instrument {
         candidates.into_iter().next()
     }
 
+    /// Find the library's `.nkc` catalogue, following the same conventions as the archive.
+    pub fn nkc_index_path(&self) -> Option<PathBuf> {
+        let is_index = |path: &Path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("nkc"))
+                .unwrap_or(false)
+        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for directory in [
+            Some(self.library_root.clone()),
+            Some(self.library_root.join("Resources")),
+            self.source_path.parent().map(Path::to_path_buf),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            candidates.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| is_index(path)),
+            );
+        }
+        candidates.sort();
+        candidates.into_iter().next()
+    }
+
+    /// Parse the library's `.nkc` catalogue, when it ships one.
+    ///
+    /// A packed library addresses its samples by name and offset through this index; the payload
+    /// itself lives in `.nkx`/`.nkr` and, for `.ncw` samples, still needs a codec we do not have.
+    pub fn nkc_index(&self) -> Option<crate::nkc::NkcIndex> {
+        let path = self.nkc_index_path()?;
+        let bytes = std::fs::read(&path).ok()?;
+        crate::nkc::parse_nkc(&bytes).ok()
+    }
+
     pub fn resource_archive(&self) -> Option<crate::archive::ResourceArchive> {
         let path = self.resource_archive_path()?;
         let bytes = std::fs::read(&path).ok()?;
+        // The catalogue says exactly where each payload starts. Not every library ships one, and a
+        // catalogue that belongs to a different product will not describe this container, so the
+        // order-based scan stays as the fallback.
+        if let Some(index) = self.nkc_index() {
+            if let Some(archive) = crate::archive::archive_from_index(&bytes, &index) {
+                return Some(archive);
+            }
+        }
         let archive = crate::archive::parse_resource_archive(&bytes);
         if archive.entries.is_empty() {
             return None;
         }
         Some(archive)
     }
+}
+
+/// Parse `<library>/Resources/*.nkc`, `<library>/*.nkc` or the one beside the `.nki`.
+fn parse_nkc_index(source: &Path, library_root: &Path) -> Option<crate::nkc::NkcIndex> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for directory in [
+        Some(library_root.to_path_buf()),
+        Some(library_root.join("Resources")),
+        source.parent().map(Path::to_path_buf),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        candidates.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("nkc"))
+                .unwrap_or(false)
+        }));
+    }
+    candidates.sort();
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Ok(index) = crate::nkc::parse_nkc(&bytes) {
+            return Some(index);
+        }
+    }
+    None
 }
 
 /// Union of the zone key ranges, dropped to the Program range and to MIDI 0..=127.
@@ -482,6 +597,7 @@ pub struct InstrumentStats {
     pub zones_with_samples: usize,
     pub resolved_sample_files: usize,
     pub unresolved_sample_files: usize,
+    pub packed_sample_files: usize,
     pub scripts: usize,
     pub memory_bytes_total: f64,
 }

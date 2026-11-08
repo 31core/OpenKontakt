@@ -63,7 +63,7 @@ fn main() {
     );
 
     // Picture buttons: clicking one runs its `on ui_control`, which is how radio groups work.
-    let names: Vec<String> = (0..runtime.slot_count())
+    let _names: Vec<String> = (0..runtime.slot_count())
         .flat_map(|slot| runtime.controls(slot))
         .filter(|c| {
             use openkontakt::ksp::parser::UiKind;
