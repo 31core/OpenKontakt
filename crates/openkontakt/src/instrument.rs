@@ -357,8 +357,19 @@ impl Instrument {
         }
         let entry = self.filename_table.as_ref()?.wallpaper(index)?;
         let (container, inner) = split_packed_reference(&entry.display_path())?;
-        let base = self.source_path.parent().unwrap_or(Path::new("."));
-        let container = normalise_path(&base.join(container));
+        let container = if container.is_absolute() {
+            // A leading `/` addresses the installed Kontakt's shared content root, not the file
+            // system root: factory impulse responses are written
+            // `/presets/Effects/Convolution/K4IR.nkx/…` and live under `<content root>/Presets/…`.
+            // The stored spelling is lower case while the folder is `Presets`, so the walk below
+            // matches each component case-insensitively.
+            let relative = container.strip_prefix("/").unwrap_or(&container);
+            let root = crate::resolve::factory_content_root()?;
+            resolve_case_insensitive(&root, relative)?
+        } else {
+            let base = self.source_path.parent().unwrap_or(Path::new("."));
+            normalise_path(&base.join(&container))
+        };
         if !container.is_file() {
             return None;
         }
@@ -904,6 +915,34 @@ fn choose_archive(
         return None;
     }
     Some(scanned)
+}
+
+/// Follow `relative` under `root`, matching each component case-insensitively.
+///
+/// Factory references are stored lower case (`presets/…`) while the installed folders are not
+/// (`Presets/…`), which matters on a case-sensitive file system.
+fn resolve_case_insensitive(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let candidate = current.join(name);
+        if candidate.exists() {
+            current = candidate;
+            continue;
+        }
+        let wanted = name.to_string_lossy().to_ascii_lowercase();
+        let mut matched = None;
+        for entry in std::fs::read_dir(&current).ok()?.flatten() {
+            if entry.file_name().to_string_lossy().to_ascii_lowercase() == wanted {
+                matched = Some(entry.path());
+                break;
+            }
+        }
+        current = matched?;
+    }
+    Some(current)
 }
 
 /// Split a `<container>.nkr/<path inside>` reference into its two halves.

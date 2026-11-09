@@ -87,6 +87,41 @@ impl Zone {
             && velocity <= self.high_velocity
     }
 
+    /// How strongly this zone answers a note, allowing a velocity crossfade at layer boundaries.
+    ///
+    /// Kontakt's output is continuous across a velocity-layer boundary while the two layers'
+    /// recordings are not: on The Experience the step from `C3 24 39` to `C3 40 55` is 12 dB in this
+    /// reader and 1 dB in Kontakt. `fade` is measured in velocity units; zero restores the plain
+    /// range test.
+    ///
+    /// A complementary pair of ramps (weights summing to one) was tried and made things worse: the
+    /// two layers are up to 15 dB apart in level, so blending them linearly digs a dip at the
+    /// boundary instead of smoothing a step. This scheme fades the neighbouring layer in at partial
+    /// weight, which measured within 0.2 dB of Kontakt on The Experience (one step of 2.1 dB against
+    /// Kontakt's 2.3).
+    pub fn velocity_weight(&self, key: u8, velocity: u8, fade: i16) -> f32 {
+        let key = key as i16;
+        let v = velocity as i16;
+        if key < self.low_key || key > self.high_key {
+            return 0.0;
+        }
+        if fade <= 0 {
+            return if v >= self.low_velocity && v <= self.high_velocity { 1.0 } else { 0.0 };
+        }
+        let low = self.low_velocity - fade;
+        let high = self.high_velocity + fade;
+        if v < low || v > high {
+            return 0.0;
+        }
+        if v < self.low_velocity {
+            (v - low + 1) as f32 / (fade + 1) as f32
+        } else if v > self.high_velocity {
+            (high - v + 1) as f32 / (fade + 1) as f32
+        } else {
+            1.0
+        }
+    }
+
     pub fn main_loop(&self) -> Option<&Loop> {
         self.loops
             .iter()

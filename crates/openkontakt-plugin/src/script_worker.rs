@@ -125,6 +125,12 @@ fn dispatch(runtime: &KspRuntime, command: ScriptCommand) -> Dispatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IrSource {
     File(String),
+    /// No impulse response could be loaded, so a decaying-noise one is generated.
+    ///
+    /// A library may name a response inside Kontakt's own factory content — `K4IR.nkx` — which
+    /// OpenKontakt can neither ship nor parse. Generating one keeps the reverb send from doing
+    /// nothing, and the result is labelled as synthetic rather than passed off as the original.
+    Synthetic,
     Packed {
         container: std::path::PathBuf,
         start: usize,
@@ -219,6 +225,27 @@ pub(crate) fn build(
             start,
             size,
         } => openkontakt::wav::load_ncw_range(container, *start, *size).ok()?,
+        IrSource::Synthetic => {
+            let rate = 48_000usize;
+            let frames = rate * 2;
+            let mut left = vec![0.0f32; frames];
+            let mut right = vec![0.0f32; frames];
+            // Deterministic: the same render has to give the same file every time.
+            let mut seed = 0x2545_F491u32;
+            let mut noise = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            for frame in 0..frames {
+                let t = frame as f32 / rate as f32;
+                let envelope = (-t * 3.0).exp();
+                left[frame] = noise() * envelope * 0.05;
+                right[frame] = noise() * envelope * 0.05;
+            }
+            return Some(openkontakt::dsp::Convolver::new(&left, &right, block_size));
+        }
     };
     let frames = sample.frames;
     if frames == 0 {

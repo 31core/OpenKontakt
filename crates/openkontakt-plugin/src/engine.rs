@@ -188,6 +188,13 @@ impl Default for Voice {
     }
 }
 
+/// Which half of a note's life a group belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerPhase {
+    NoteOn,
+    NoteOff,
+}
+
 pub struct Engine {
     sample_rate: f32,
     voices: Vec<Voice>,
@@ -322,17 +329,44 @@ impl Engine {
         // A convolution module (`0x16`) names its impulse response as a filename reference. The
         // engine's reverb return is driven by the send level, so the IR only has to be found; the
         // slot's output gain is the wet trim.
-        for rack in effects::program_racks(&loaded.instrument.program.children) {
+        // A library can name a factory impulse response — `/presets/Effects/Convolution/K4IR.nkx/…`
+        // — whose container this reader cannot index, in which case the reverb would silently do
+        // nothing. `OPENKONTAKT_IR` substitutes an impulse response file so the reverb path can be
+        // exercised (and a differential attributed) without it.
+        let override_ir = std::env::var("OPENKONTAKT_IR").ok().filter(|p| !p.is_empty());
+        for rack in effects::program_racks(&loaded.instrument.program.children).iter() {
             for slot in rack.slots.iter().flatten() {
-                if let ModuleParams::Convolution { ir_index } = effects::decode(slot) {
-                    // A packed library names its impulse responses inside the resource package,
-                    // so the reference is resolved through the catalogue as well as the disk.
-                    if let Some(resource) =
-                        ir_index.and_then(|index| loaded.instrument.other_resource(index))
-                    {
-                        self.rack_ir = Some(crate::script_worker::IrSource::from_other(&resource));
-                        self.rack_ir_gain = slot.output_gain.clamp(0.0, 8.0);
+                match effects::decode(slot) {
+                    ModuleParams::Convolution { ir_index } => {
+                        // The send is left to the script (`$ENGINE_PAR_SENDLEVEL_n`). Reading it
+                        // from the program's send matrix looked right on paper but made every
+                        // render wetter than Kontakt's: The Experience's reference output is dry —
+                        // it has six consecutive 100 ms windows of digital silence at 247 s, which
+                        // no reverb tail can produce — so the matrix does not mean what the field
+                        // layout suggests.
+                        let synthetic = override_ir
+                            .as_deref()
+                            .is_some_and(|value| value == "@synthetic");
+                        let source = if synthetic {
+                            Some(crate::script_worker::IrSource::Synthetic)
+                        } else {
+                            override_ir
+                                .clone()
+                                .map(crate::script_worker::IrSource::File)
+                                .or_else(|| {
+                                    let resource = ir_index
+                                        .and_then(|index| loaded.instrument.other_resource(index))?;
+                                    Some(crate::script_worker::IrSource::from_other(&resource))
+                                })
+                        };
+                        // Nothing to load means no convolver, which is the right answer for an
+                        // instrument whose reference output is dry.
+                        if let Some(source) = source {
+                            self.rack_ir = Some(source);
+                            self.rack_ir_gain = slot.output_gain.clamp(0.0, 8.0);
+                        }
                     }
+                    _ => {}
                 }
             }
         }
@@ -654,6 +688,10 @@ impl Engine {
                 voice.env.release();
             }
         }
+        let velocity = self.event_velocity[key as usize & 127];
+        // The release-trigger groups are part of the instrument's normal group set; a script that
+        // only routes note-on groups would otherwise silence every release sample.
+        self.trigger_phase(key, velocity, None, TriggerPhase::NoteOff);
         self.execute_actions(&dispatch.actions, dispatch.allowed_groups.as_deref());
     }
 
@@ -760,6 +798,22 @@ impl Engine {
     }
 
     fn trigger(&mut self, key: u8, velocity_127: u8, allowed: Option<&[bool]>) {
+        self.trigger_phase(key, velocity_127, allowed, TriggerPhase::NoteOn);
+    }
+
+    /// Start voices for a key, restricted to the groups that belong to this phase.
+    ///
+    /// A release-trigger group is the recorded sound of the key being let go: playing it on note-on
+    /// puts the release in the attack, which is audible as a click and as a level that does not
+    /// belong to the note. Measured on The Experience, 8Dio's `RTD`/`RTN` samples were firing on
+    /// note-on at gain 0.12–0.27 while the note's own samples sat at 0.019.
+    fn trigger_phase(
+        &mut self,
+        key: u8,
+        velocity_127: u8,
+        allowed: Option<&[bool]>,
+        phase: TriggerPhase,
+    ) {
         let Some(loaded) = self.current.clone() else {
             return;
         };
@@ -779,8 +833,23 @@ impl Engine {
         // library has several such cycles sharing one record, so this selects *every* matching
         // group, not one: a note must sound one variant of each microphone at once.
         let active = self.round_robin_choice(instrument, allowed);
+        let mut started = 0usize;
+        // A layer boundary is where two velocity-layered recordings abut. Playing only the one
+        // whose range contains the velocity makes our output step by the difference between the
+        // recordings — measured at 12 dB on The Experience where Kontakt steps by 1 dB. Fading the
+        // neighbouring layer in over a few velocity units removes the step without touching the
+        // curve inside a layer.
+        // Measured against Kontakt over the 127-step sweep: a width of 8 leaves one 2.1 dB step
+        // where hard switching leaves five steps and a 12 dB jump, and Kontakt itself shows one
+        // 2.3 dB step. Wider than 8 starts to flatten the curve inside a layer (12 already drags
+        // the median down by 0.5 dB).
+        let fade: i16 = std::env::var("OPENKONTAKT_VELOCITY_FADE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
         for zone in &instrument.zones {
-            if !zone.matches(key, velocity_127) {
+            let layer_weight = zone.velocity_weight(key, velocity_127, fade);
+            if layer_weight <= 0.0 {
                 continue;
             }
             if let Some(mask) = allowed {
@@ -791,6 +860,9 @@ impl Engine {
             let Some(group) = instrument.groups.get(zone.group_index) else {
                 continue;
             };
+            if group.release_trigger != (phase == TriggerPhase::NoteOff) {
+                continue;
+            }
             if group.muted || (any_solo && !group.soloed) {
                 continue;
             }
@@ -851,12 +923,42 @@ impl Engine {
                 continue;
             }
 
-            let velocity_gain = velocity_127 as f32 / 127.0;
-            let base_gain = (instrument.program.params.volume.max(0.0)
+            // Kontakt's velocity law is gentle, and the samples already carry most of the dynamics
+            // through their velocity layers. Measured over the full 1..127 sweep on The Experience,
+            // its output follows velocity^1.18 while the samples alone slope at 1.03, so the gain
+            // it adds is about velocity^0.15. A linear `v/127` made quiet notes 20 dB too quiet;
+            // with 0.15 the sweep matches p=1.18 and a 34.1 dB range against Kontakt's 35.3 dB.
+            let exponent: f32 = std::env::var("OPENKONTAKT_VELOCITY_EXP")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0.15);
+            let velocity_gain = (velocity_127 as f32 / 127.0).powf(exponent);
+            let trim: f32 = std::env::var("OPENKONTAKT_GAIN")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1.0);
+            // `OPENKONTAKT_GAIN_MODE=no_program|zone` restores the discarded factor for a
+            // regression comparison; the default applies neither experiment.
+            let mode = std::env::var("OPENKONTAKT_GAIN_MODE").unwrap_or_default();
+            // `program.volume` is a plain gain: with it applied, a library whose value is 1.005
+            // lands within 0.1 dB of Kontakt and one at 0.286 within 1.9 dB.
+            let program_volume = if mode == "no_program" {
+                1.0
+            } else {
+                instrument.program.params.volume.max(0.0)
+            };
+            // The zone private trim is *not* a playback gain, whatever it measures. Applying it
+            // put The Experience 13.9 dB under Kontakt and Studio One 5.8 dB under, and it made
+            // Studio One's round-robin takes alternate by 7 dB (one file carries 0.5 while its
+            // siblings carry 1.0). Dropping it brings both libraries to +1.9 and +0.1 dB.
+            let zone_gain = if mode == "zone" { zone.gain } else { 1.0 };
+            let base_gain = (trim
+                * program_volume
                 * zone.volume.max(0.0)
-                * zone.gain
+                * zone_gain
                 * group.volume.max(0.0)
-                * velocity_gain)
+                * velocity_gain
+                * layer_weight)
                 .clamp(0.0, 8.0);
             let pan = (zone.pan + group.pan + program.pan).clamp(-1.0, 1.0);
             let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
@@ -865,6 +967,7 @@ impl Engine {
             let event_id = self.event_ids[key as usize & 127];
             let envelope = self.voice_envelope(zone.group_index);
 
+            started += 1;
             self.start_voice(Voice {
                 active: true,
                 note: key,
@@ -892,6 +995,9 @@ impl Engine {
                 },
                 event_id,
             });
+        }
+        if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() && phase == TriggerPhase::NoteOff {
+            eprintln!("debug: release trigger for {key} started {started} voices");
         }
     }
 
@@ -961,6 +1067,8 @@ impl Engine {
                 voice.env.release();
             }
         }
+        let velocity = self.event_velocity[key as usize & 127];
+        self.trigger_phase(key, velocity, None, TriggerPhase::NoteOff);
     }
 
     pub fn choke_all(&mut self) {

@@ -68,6 +68,9 @@ pub struct AudioSample {
     pub frames: usize,
     /// Peak of the preloaded region; 0 when nothing was preloaded.
     pub peak: f32,
+    /// RMS of the preloaded region, which is what the loader measures for layer levelling.
+    /// Zero when nothing was preloaded.
+    pub rms: f32,
     /// Bytes touched at load time (the DFD preload), which is what the process actually holds.
     pub resident_bytes: u64,
     backing: Backing,
@@ -101,6 +104,7 @@ impl AudioSample {
             channels: 1,
             frames: 0,
             peak: 0.0,
+            rms: 0.0,
             resident_bytes: 0,
             backing: Backing::Owned(Vec::new()),
         }
@@ -558,12 +562,14 @@ pub fn map_wav(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
     let frame_bytes = (info.channels as usize).max(1) * info.format.bytes();
     let preload = (preload_bytes / frame_bytes).min(info.frames);
     let mut peak = 0.0f32;
+    let mut rms = 0.0f32;
     let sample = AudioSample {
         path: path.to_path_buf(),
         sample_rate: info.sample_rate,
         channels: info.channels,
         frames: info.frames,
         peak: 0.0,
+        rms: 0.0,
         // Touching a mapped WAV brings the file's own bytes in as file-backed pages, so the
         // resident cost is the source size, not an f32 copy.
         resident_bytes: (preload * frame_bytes) as u64,
@@ -573,13 +579,18 @@ pub fn map_wav(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
             format: info.format,
         },
     };
-    // Touch the preloaded region and measure its peak.
+    // Touch the preloaded region and measure its peak and level.
+    let mut energy = 0.0f64;
     for index in 0..preload {
         let (left, right) = sample.frame(index);
         peak = peak.max(left.abs()).max(right.abs());
+        energy += (left as f64).powi(2) + (right as f64).powi(2);
+    }
+    if preload > 0 {
+        rms = (energy / (preload as f64 * 2.0)).sqrt() as f32;
     }
     let _ = &map;
-    Ok(AudioSample { peak, ..sample })
+    Ok(AudioSample { peak, rms, ..sample })
 }
 
 /// Open a sample file, picking the decoder from the extension.
@@ -665,6 +676,8 @@ fn open_ncw_range(
     let frame_bytes = (info.channels as usize).max(1) * ((info.bits as usize).max(1) / 8);
     let preload = (preload_bytes / frame_bytes.max(1)).min(file.frames());
     let mut peak = 0.0f32;
+    let mut energy = 0.0f64;
+    let mut counted = 0usize;
     let mut decoded = Vec::with_capacity(crate::ncw::FRAMES_PER_BLOCK * info.channels as usize);
     let mut block = 0;
     let mut reached = 0;
@@ -677,6 +690,8 @@ fn open_ncw_range(
             })?;
         for value in decoded.iter() {
             peak = peak.max(value.abs());
+            energy += (*value as f64).powi(2);
+            counted += 1;
         }
         reached += file.block_frames(block);
         block += 1;
@@ -687,6 +702,11 @@ fn open_ncw_range(
         channels: info.channels,
         frames: file.frames(),
         peak,
+        rms: if counted > 0 {
+            (energy / counted as f64).sqrt() as f32
+        } else {
+            0.0
+        },
         resident_bytes: (decoded.len() * std::mem::size_of::<f32>()) as u64,
         backing: Backing::Ncw {
             map,
@@ -748,6 +768,13 @@ pub fn decode_ncw_bytes(path: &Path, bytes: &[u8], preload_bytes: usize) -> Resu
         channels: audio.channels,
         frames: audio.frames,
         peak,
+        rms: if audio.samples.is_empty() {
+            0.0
+        } else {
+            (audio.samples.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+                / audio.samples.len() as f64)
+                .sqrt() as f32
+        },
         resident_bytes: (audio.samples.len() * std::mem::size_of::<f32>()) as u64,
         backing: Backing::Owned(audio.samples),
     })
@@ -795,6 +822,12 @@ pub fn load_wav(path: &Path) -> Result<AudioSample> {
         channels: info.channels,
         frames: info.frames,
         peak,
+        rms: if decoded.is_empty() {
+            0.0
+        } else {
+            (decoded.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / decoded.len() as f64)
+                .sqrt() as f32
+        },
         resident_bytes: (decoded.len() * 4) as u64,
         backing: Backing::Owned(decoded),
     })
