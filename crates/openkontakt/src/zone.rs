@@ -106,7 +106,11 @@ impl Zone {
             return 0.0;
         }
         if fade <= 0 {
-            return if v >= self.low_velocity && v <= self.high_velocity { 1.0 } else { 0.0 };
+            return if v >= self.low_velocity && v <= self.high_velocity {
+                1.0
+            } else {
+                0.0
+            };
         }
         let low = self.low_velocity - fade;
         let high = self.high_velocity + fade;

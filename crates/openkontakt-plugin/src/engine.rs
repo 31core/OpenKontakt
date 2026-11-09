@@ -1,13 +1,13 @@
 use crate::fx;
 use crate::script_worker::{IrLoader, ScriptCommand, ScriptWorker};
 use crate::state::LoadedInstrument;
-use openkontakt::{AudioSample, SampleCursor};
 use openkontakt::Instrument;
 use openkontakt::dsp::Convolver;
 use openkontakt::effects::{self, ModuleParams};
 use openkontakt::envelope::{self, Ahdsr};
 use openkontakt::ksp::EventContext;
 use openkontakt::ksp::ScriptAction;
+use openkontakt::{AudioSample, SampleCursor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -333,7 +333,9 @@ impl Engine {
         // — whose container this reader cannot index, in which case the reverb would silently do
         // nothing. `OPENKONTAKT_IR` substitutes an impulse response file so the reverb path can be
         // exercised (and a differential attributed) without it.
-        let override_ir = std::env::var("OPENKONTAKT_IR").ok().filter(|p| !p.is_empty());
+        let override_ir = std::env::var("OPENKONTAKT_IR")
+            .ok()
+            .filter(|p| !p.is_empty());
         for rack in effects::program_racks(&loaded.instrument.program.children).iter() {
             for slot in rack.slots.iter().flatten() {
                 match effects::decode(slot) {
@@ -354,8 +356,9 @@ impl Engine {
                                 .clone()
                                 .map(crate::script_worker::IrSource::File)
                                 .or_else(|| {
-                                    let resource = ir_index
-                                        .and_then(|index| loaded.instrument.other_resource(index))?;
+                                    let resource = ir_index.and_then(|index| {
+                                        loaded.instrument.other_resource(index)
+                                    })?;
                                     Some(crate::script_worker::IrSource::from_other(&resource))
                                 })
                         };

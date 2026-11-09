@@ -21,14 +21,14 @@ fn main() {
     let audio = decode_ncw(&bytes).expect("decode");
 
     let peak = audio.samples.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
-    let sum: f64 = audio.samples.iter().map(|v| (*v as f64) * (*v as f64)).sum();
-    let rms = (sum / audio.samples.len().max(1) as f64).sqrt();
-    let dc: f64 = audio
+    let sum: f64 = audio
         .samples
         .iter()
-        .map(|v| *v as f64)
-        .sum::<f64>()
-        / audio.samples.len().max(1) as f64;
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum();
+    let rms = (sum / audio.samples.len().max(1) as f64).sqrt();
+    let dc: f64 =
+        audio.samples.iter().map(|v| *v as f64).sum::<f64>() / audio.samples.len().max(1) as f64;
     let silent = audio.samples.iter().filter(|v| **v == 0.0).count();
     let db = |value: f32| {
         if value > 0.0 {
@@ -79,10 +79,7 @@ fn main() {
                 let (left, right) = cursor.frame(frame);
                 for (got, want) in [
                     (left, audio.samples[frame * audio.channels as usize]),
-                    (
-                        right,
-                        audio.samples[frame * audio.channels as usize + 1],
-                    ),
+                    (right, audio.samples[frame * audio.channels as usize + 1]),
                 ] {
                     if (got - want).abs() > worst {
                         worst = (got - want).abs();

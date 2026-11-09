@@ -116,7 +116,11 @@ pub fn load_instrument(path: &std::path::Path) -> Result<LoadedInstrument, openk
     // it impossible to tell "the sample path is broken" from "the script is". Skipping the scripts
     // plays the plain zone mapping instead.
     let without_scripts = std::env::var("OPENKONTAKT_NO_SCRIPTS").is_ok();
-    let texts = if without_scripts { vec![None; texts.len()] } else { texts };
+    let texts = if without_scripts {
+        vec![None; texts.len()]
+    } else {
+        texts
+    };
     let ksp = Arc::new(KspRuntime::compile_with_groups(&texts, &root, groups));
     ksp.initialize();
     for slot in &instrument.scripts {

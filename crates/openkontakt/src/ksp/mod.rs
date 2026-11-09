@@ -182,6 +182,9 @@ pub struct UiControl {
     pub table: Vec<i64>,
     /// `$CONTROL_PAR_BAR_COLOR`, the colour a table draws its bars in.
     pub bar_color: Option<i64>,
+    /// Parts hidden with `hide_part`: 1 = background, 2 = cursor, 4 = value, 8 = title,
+    /// 16 = whole control.
+    pub hidden_parts: u32,
 }
 
 impl UiControl {
@@ -224,6 +227,7 @@ impl UiControl {
             pixel_width: None,
             pixel_height: None,
             table: Vec::new(),
+            hidden_parts: 0,
             bar_color: None,
             mouse_behaviour: 0,
         }
@@ -284,6 +288,8 @@ pub trait Host {
 
     /// `set_ui_height_px`.
     fn panel_height(&mut self, _height: f32) {}
+    /// `set_skin_offset`: which vertical band of the skin image this page shows.
+    fn skin_offset(&mut self, _offset: f32) {}
     fn load_ir_sample(&mut self, _path: &str, _slot: i64, _generic: i64) -> bool {
         false
     }
@@ -367,6 +373,10 @@ pub struct EngineState {
     icon_picture: Mutex<Option<String>>,
     /// Panel height a script asked for with `set_ui_height_px`.
     panel_height: Mutex<Option<f32>>,
+    /// Per-slot panel height, so each page keeps its own.
+    panel_heights: Mutex<HashMap<usize, f32>>,
+    /// Per-slot `set_skin_offset` values.
+    skin_offsets: Mutex<HashMap<usize, f32>>,
 }
 
 impl Default for EngineState {
@@ -380,6 +390,8 @@ impl Default for EngineState {
             wallpaper_picture: Mutex::new(None),
             icon_picture: Mutex::new(None),
             panel_height: Mutex::new(None),
+            panel_heights: Mutex::new(HashMap::new()),
+            skin_offsets: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -428,6 +440,22 @@ impl EngineState {
     }
 
     /// Panel height a script asked for with `set_ui_height_px`.
+    /// `set_skin_offset` of one script slot, in image pixels.
+    pub fn skin_offset(&self, slot: usize) -> Option<f32> {
+        self.skin_offsets
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&slot).copied())
+    }
+
+    /// `set_ui_height_px` of one script slot.
+    pub fn panel_height_for(&self, slot: usize) -> Option<f32> {
+        self.panel_heights
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&slot).copied())
+    }
+
     pub fn panel_height(&self) -> Option<f32> {
         self.panel_height.lock().ok().and_then(|value| *value)
     }
@@ -485,6 +513,9 @@ impl EngineState {
 /// KSP exposes through `$NI_BUS_OFFSET`.
 pub struct EngineHost {
     pub state: Arc<EngineState>,
+    /// Slot this host is running; per-page panel settings (height, skin offset) are stored
+    /// against it.
+    pub slot: usize,
     pub root: String,
     pub groups: Arc<Vec<GroupInfo>>,
     /// `None` until the script routes groups; otherwise one flag per group.
@@ -667,6 +698,15 @@ impl Host for EngineHost {
         // one. Keeping the last value let a one-row utility script shrink a 536 px panel to 23.
         if let Ok(mut value) = self.state.panel_height.lock() {
             *value = Some(value.map_or(height, |current| current.max(height)));
+        }
+        if let Ok(mut heights) = self.state.panel_heights.lock() {
+            heights.insert(self.slot, height);
+        }
+    }
+
+    fn skin_offset(&mut self, offset: f32) {
+        if let Ok(mut offsets) = self.state.skin_offsets.lock() {
+            offsets.insert(self.slot, offset);
         }
     }
 
@@ -1266,6 +1306,32 @@ impl<'a> Interp<'a> {
                 self.host.ignore_event();
                 Ok(Value::Int(0))
             }
+            "hide_part" => {
+                let id = self.control_arg(args)?;
+                let part = symbol_arg(1).unwrap_or_default().to_ascii_uppercase();
+                let bit = if part.contains("WHOLE_CONTROL") {
+                    16
+                } else if part.contains("PART_BG") {
+                    1
+                } else if part.contains("CURSOR") {
+                    2
+                } else if part.contains("PART_VALUE") {
+                    4
+                } else if part.contains("PART_TITLE") {
+                    8
+                } else {
+                    0
+                };
+                if let Some(control) = id.and_then(|id| self.ui.get_mut(id)) {
+                    control.hidden_parts |= bit;
+                }
+                Ok(Value::Int(0))
+            }
+            "set_skin_offset" => {
+                let offset = self.eval_arg(args, 0)? as f32;
+                self.host.skin_offset(offset);
+                Ok(Value::Int(0))
+            }
             "set_ui_height_px" => {
                 let height = self.eval_arg(args, 0)? as f32;
                 self.host.panel_height(height);
@@ -1595,6 +1661,7 @@ impl KspRuntime {
             return;
         };
         let mut host = EngineHost {
+            slot: index,
             state: Arc::clone(&self.engine),
             root: self.root.clone(),
             groups: Arc::clone(&self.groups),
@@ -1647,6 +1714,7 @@ impl KspRuntime {
             return;
         }
         let mut host = EngineHost {
+            slot: index,
             state: Arc::clone(&self.engine),
             root: self.root.clone(),
             groups: Arc::clone(&self.groups),
@@ -1727,6 +1795,7 @@ impl KspRuntime {
             .cloned()
             .collect();
         let mut host = EngineHost {
+            slot: index,
             state: Arc::clone(&self.engine),
             root: self.root.clone(),
             groups: Arc::clone(&self.groups),
@@ -1815,6 +1884,7 @@ impl KspRuntime {
             }
 
             let mut host = EngineHost {
+                slot: slot,
                 state: Arc::clone(&self.engine),
                 root: self.root.clone(),
                 groups: Arc::clone(&self.groups),
@@ -1902,6 +1972,7 @@ impl KspRuntime {
                 continue;
             }
             let mut host = EngineHost {
+                slot: slot,
                 state: Arc::clone(&self.engine),
                 root: self.root.clone(),
                 groups: Arc::clone(&self.groups),
@@ -1957,6 +2028,7 @@ impl KspRuntime {
             .cloned()
             .collect();
         let mut host = EngineHost {
+            slot: index,
             state: Arc::clone(&self.engine),
             root: self.root.clone(),
             groups: Arc::clone(&self.groups),
@@ -1981,6 +2053,38 @@ impl KspRuntime {
         state.vars = interp.vars;
         state.ui = interp.ui;
         ok
+    }
+
+    /// Edit one step of a `ui_table`. KONTAKT writes the value straight into the array the table
+    /// is bound to, so the script sees it on its next pass.
+    pub fn set_table_element(
+        &self,
+        index: usize,
+        control: &str,
+        element: usize,
+        value: i64,
+    ) -> bool {
+        let Ok(mut state) = self.slots[index].lock() else {
+            return false;
+        };
+        let Some(ui) = state.ui.iter_mut().find(|c| c.name == bare(control)) else {
+            return false;
+        };
+        let value = value.clamp(ui.min.min(0), ui.max.max(1));
+        if let Some(step) = ui.table.get_mut(element) {
+            *step = value;
+        }
+        // A `ui_table` is bound to an array, and arrays live under their `%` name.
+        let array = format!("%{}", bare(control));
+        let name = if state.vars.vars.contains_key(&array) {
+            array
+        } else {
+            bare(control).to_string()
+        };
+        state
+            .vars
+            .set_index(&name, element as i64, Value::Int(value));
+        true
     }
 
     /// Snapshot of every slot's controls, for the GUI.
@@ -2189,6 +2293,31 @@ mod tests {
         runtime.initialize();
         // Not present: `search` returns -1, so -1 + 5 = 4.
         assert_eq!(runtime.controls(0)[0].value, 4);
+    }
+
+    #[test]
+    fn editing_a_table_lands_in_the_array_it_is_bound_to() {
+        // Dragging a bar writes the step back into the array. Writing to the stripped name used
+        // to create a second array the panel never read, so the bars never moved.
+        let text = r#"
+        on init
+          declare const $steps := 4
+          declare ui_table %Steps[$steps](1, 1, 127)
+          %Steps[0] := 10
+          %Steps[1] := 20
+          %Steps[2] := 30
+          %Steps[3] := 40
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        assert!(runtime.set_table_element(0, "Steps", 1, 99));
+        let table = runtime
+            .controls(0)
+            .into_iter()
+            .find(|control| control.name == "Steps")
+            .expect("the table is a control");
+        assert_eq!(table.table, vec![10, 99, 30, 40]);
     }
 
     #[test]

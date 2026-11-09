@@ -76,7 +76,10 @@ fn main() {
                 control.width,
                 control.height
             );
-            println!("      px={} picture={:?}", control.px, control.picture);
+            println!(
+                "      px={} picture={:?} pixel={:?}x{:?}",
+                control.px, control.picture, control.pixel_width, control.pixel_height
+            );
         }
     }
     println!(

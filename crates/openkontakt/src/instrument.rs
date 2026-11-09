@@ -746,11 +746,11 @@ pub fn load_samples(instrument: &Instrument) -> LoadedSamples {
                 .map(|entry| PathBuf::from(entry.name.clone()))
                 .unwrap_or_default()
         });
-        let source_key = loose
-            .cloned()
-            .or_else(|| packed.as_ref().map(|(container, start, _)| {
+        let source_key = loose.cloned().or_else(|| {
+            packed.as_ref().map(|(container, start, _)| {
                 PathBuf::from(format!("{}#{}", container.display(), start))
-            }));
+            })
+        });
         if let Some(key) = &source_key
             && let Some(shared) = by_source.get(key)
         {
@@ -984,15 +984,12 @@ mod tests {
     use super::{find_sample_record, mapped_key_mask, normalise_path, split_packed_reference};
     use std::path::{Path, PathBuf};
 
-
     /// A sample record is a 31-byte block header followed by the `.ncw`; the catalogue offset
     /// points at the header and its `size` covers the payload only.
     #[test]
     fn finds_a_sample_record_past_the_block_header() {
-        let path = std::env::temp_dir().join(format!(
-            "openkontakt-container-{}.nkr",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("openkontakt-container-{}.nkr", std::process::id()));
         let mut container = vec![0xA5u8; 31];
         container.extend_from_slice(&crate::ncw::FILE_MAGIC);
         container.extend_from_slice(&[7u8; 64]);
@@ -1010,7 +1007,6 @@ mod tests {
         assert!(find_sample_record(&containers, 31, 9_999).is_none());
         let _ = std::fs::remove_file(&path);
     }
-
 
     /// 8Dio writes its impulse responses as `<package>.nkr/<path inside the package>`.
     fn archive_with(name: &str, data: &[u8]) -> crate::archive::ResourceArchive {

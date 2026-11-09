@@ -125,10 +125,7 @@ impl AudioSample {
 
     /// True when the audio stays on disk and is decoded as it is read.
     pub fn is_streaming(&self) -> bool {
-        matches!(
-            self.backing,
-            Backing::Mapped { .. } | Backing::Ncw { .. }
-        )
+        matches!(self.backing, Backing::Mapped { .. } | Backing::Ncw { .. })
     }
 
     /// The file this sample's bytes are mapped from, when they are mapped at all.
@@ -590,7 +587,11 @@ pub fn map_wav(path: &Path, preload_bytes: usize) -> Result<AudioSample> {
         rms = (energy / (preload as f64 * 2.0)).sqrt() as f32;
     }
     let _ = &map;
-    Ok(AudioSample { peak, rms, ..sample })
+    Ok(AudioSample {
+        peak,
+        rms,
+        ..sample
+    })
 }
 
 /// Open a sample file, picking the decoder from the extension.
@@ -771,7 +772,11 @@ pub fn decode_ncw_bytes(path: &Path, bytes: &[u8], preload_bytes: usize) -> Resu
         rms: if audio.samples.is_empty() {
             0.0
         } else {
-            (audio.samples.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+            (audio
+                .samples
+                .iter()
+                .map(|v| (*v as f64).powi(2))
+                .sum::<f64>()
                 / audio.samples.len() as f64)
                 .sqrt() as f32
         },
@@ -825,8 +830,8 @@ pub fn load_wav(path: &Path) -> Result<AudioSample> {
         rms: if decoded.is_empty() {
             0.0
         } else {
-            (decoded.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / decoded.len() as f64)
-                .sqrt() as f32
+            (decoded.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / decoded.len() as f64).sqrt()
+                as f32
         },
         resident_bytes: (decoded.len() * 4) as u64,
         backing: Backing::Owned(decoded),

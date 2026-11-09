@@ -142,9 +142,7 @@ impl IrSource {
     /// Describe an impulse response from an instrument's `other` reference.
     pub fn from_other(resource: &openkontakt::OtherResource) -> Self {
         match resource {
-            openkontakt::OtherResource::File(path) => {
-                IrSource::File(path.display().to_string())
-            }
+            openkontakt::OtherResource::File(path) => IrSource::File(path.display().to_string()),
             openkontakt::OtherResource::Packed {
                 container,
                 start,

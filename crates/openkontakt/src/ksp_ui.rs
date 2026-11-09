@@ -54,6 +54,9 @@ pub struct KspControl {
     pub table: Vec<i64>,
     /// `$CONTROL_PAR_BAR_COLOR`, the colour a table is drawn in.
     pub bar_color: Option<i64>,
+    /// Parts hidden with `hide_part`: 1 = background, 2 = cursor, 4 = value, 8 = title,
+    /// 16 = whole control.
+    pub hidden_parts: u32,
 }
 
 impl KspControl {
@@ -377,6 +380,7 @@ impl Builder {
             pixel_height: None,
             table: Vec::new(),
             bar_color: None,
+            hidden_parts: 0,
         });
     }
 

@@ -340,10 +340,7 @@ impl NcwFile {
         }
         let emitted = self.block_frames(block);
         if mid_side {
-            for (mid, side) in scratch[0][..emitted]
-                .iter()
-                .zip(&scratch[1][..emitted])
-            {
+            for (mid, side) in scratch[0][..emitted].iter().zip(&scratch[1][..emitted]) {
                 out.push(to_float(mid.wrapping_add(*side), float_mode, scale));
                 out.push(to_float(mid.wrapping_sub(*side), float_mode, scale));
             }
@@ -354,10 +351,7 @@ impl NcwFile {
                     .map(|value| to_float(*value, float_mode, scale)),
             );
         } else {
-            for (left, right) in scratch[0][..emitted]
-                .iter()
-                .zip(&scratch[1][..emitted])
-            {
+            for (left, right) in scratch[0][..emitted].iter().zip(&scratch[1][..emitted]) {
                 out.push(to_float(*left, float_mode, scale));
                 out.push(to_float(*right, float_mode, scale));
             }
@@ -660,10 +654,7 @@ mod tests {
 
     #[test]
     fn the_player_loader_reads_a_ncw_file() {
-        let path = std::env::temp_dir().join(format!(
-            "openkontakt-ncw-{}.ncw",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("openkontakt-ncw-{}.ncw", std::process::id()));
         let file = build(&tone(1200, 2), 2, 24, 48_000);
         std::fs::write(&path, &file).unwrap();
         let sample = crate::wav::open_sample(&path, 8).unwrap();
@@ -693,10 +684,8 @@ mod tests {
         use std::sync::Arc;
 
         let file = build(&tone(1500, 2), 2, 24, 48_000);
-        let path = std::env::temp_dir().join(format!(
-            "openkontakt-ncw-stream-{}.ncw",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("openkontakt-ncw-stream-{}.ncw", std::process::id()));
         std::fs::write(&path, &file).unwrap();
 
         let sample = map_ncw(&path, 128).unwrap();
@@ -724,10 +713,8 @@ mod tests {
         use std::sync::Arc;
 
         let file = build(&tone(2000, 1), 1, 24, 48_000);
-        let path = std::env::temp_dir().join(format!(
-            "openkontakt-ncw-jump-{}.ncw",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("openkontakt-ncw-jump-{}.ncw", std::process::id()));
         std::fs::write(&path, &file).unwrap();
         let sample = map_ncw(&path, 0).unwrap();
         let expected = decode_ncw(&file).unwrap();
@@ -753,10 +740,8 @@ mod tests {
         let mut container = vec![0xA5u8; 31];
         container.extend_from_slice(&payload);
         container.extend_from_slice(&[0u8; 16]);
-        let path = std::env::temp_dir().join(format!(
-            "openkontakt-ncw-packed-{}.nkr",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("openkontakt-ncw-packed-{}.nkr", std::process::id()));
         std::fs::write(&path, &container).unwrap();
 
         let sample = map_ncw_range(&path, &path, 31, payload.len(), 64).unwrap();

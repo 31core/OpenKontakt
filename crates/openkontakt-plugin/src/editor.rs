@@ -71,21 +71,30 @@ struct PictureResource {
     horizontal: bool,
     /// Frame size in native pixels.
     frame: Vec2,
+    /// KONTAKT only stretches a picture when the sidecar allows it; otherwise the sprite is
+    /// drawn at its native pixel size whatever `$CONTROL_PAR_WIDTH/HEIGHT` say.
+    resizable: bool,
 }
 
-/// Parse a picture's `.txt` sidecar: sprite frame count and animation axis.
-fn picture_metadata_from_text(text: &str) -> (usize, bool) {
+/// Parse a picture's `.txt` sidecar: sprite frame count, animation axis and whether the sprite
+/// may be stretched to the control's size.
+fn picture_metadata_from_text(text: &str) -> (usize, bool, bool) {
     let mut frames = 1usize;
     let mut horizontal = true;
+    let mut resizable = false;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("number of animations:") {
             frames = rest.trim().parse().unwrap_or(1);
         } else if lower.starts_with("horizontal animation:") {
             horizontal = lower.contains("yes");
+        } else if lower.starts_with("vertical resizable:")
+            || lower.starts_with("horizontal resizable:")
+        {
+            resizable |= lower.contains("yes");
         }
     }
-    (frames, horizontal)
+    (frames, horizontal, resizable)
 }
 
 /// Which page the main area shows.
@@ -103,6 +112,11 @@ pub struct OpenKontaktEditor {
     background_source: Option<BackgroundSource>,
     /// Height of the first page of a wallpaper that stacks several pages, in image pixels.
     background_page: Option<u32>,
+    /// Luminance of the wallpaper (width, height, pixels), kept so table bars can be snapped to
+    /// the grid lines the artwork draws.
+    wallpaper_luma: Option<(usize, usize, Vec<u8>)>,
+    /// How far the displayed wallpaper page is shifted up, in image pixels.
+    wallpaper_shift_native: f32,
     /// Instrument header icon a script assigned to `$INST_ICON_ID`.
     header_icon: Option<TextureHandle>,
     header_icon_source: Option<String>,
@@ -117,6 +131,16 @@ pub struct OpenKontaktEditor {
     ksp_values: Vec<(String, f32)>,
     ksp_slots: Vec<(String, usize)>,
     ksp_labels: Vec<(String, String)>,
+    /// Script slot whose performance view is shown. KONTAKT gives every slot that calls
+    /// `make_perfview` its own page, reachable through the tab strip under the panel.
+    ksp_active_slot: Option<usize>,
+    /// Pages available for the loaded instrument, in slot order.
+    ksp_tabs: Vec<(usize, String)>,
+    /// Instrument the cached tab list belongs to.
+    ksp_tabs_path: Option<String>,
+    /// Vertical scroll of the panel, 0..1. The KSP view can be taller than the area it is drawn
+    /// into, in which case KONTAKT puts a scroll bar on its right edge.
+    ksp_scroll: f32,
     /// Menu control currently expanded, if any.
     open_menu: Option<String>,
     /// Instrument whose saved panel values have already been restored.
@@ -154,6 +178,8 @@ impl OpenKontaktEditor {
             header_icon_source: None,
             pictures: HashMap::new(),
             background_page: None,
+            wallpaper_luma: None,
+            wallpaper_shift_native: 0.0,
             pictures_root: None,
             show_file_menu: false,
             show_recent_menu: false,
@@ -163,6 +189,10 @@ impl OpenKontaktEditor {
             ksp_values: Vec::new(),
             ksp_slots: Vec::new(),
             ksp_labels: Vec::new(),
+            ksp_active_slot: None,
+            ksp_tabs: Vec::new(),
+            ksp_tabs_path: None,
+            ksp_scroll: 0.0,
             open_menu: None,
             panel_restored: None,
             mouse_note: None,
@@ -280,11 +310,11 @@ impl OpenKontaktEditor {
             } else {
                 image
             };
-            let (frames, horizontal) = asset
+            let (frames, horizontal, resizable) = asset
                 .text
                 .as_deref()
                 .map(picture_metadata_from_text)
-                .unwrap_or((1, true));
+                .unwrap_or((1, true, false));
             let size = [image.width() as usize, image.height() as usize];
             if size[0] == 0 || size[1] == 0 {
                 continue;
@@ -312,6 +342,7 @@ impl OpenKontaktEditor {
                     frames,
                     horizontal,
                     frame,
+                    resizable,
                 },
             );
         }
@@ -346,6 +377,7 @@ impl OpenKontaktEditor {
         }
         self.background = None;
         self.background_page = None;
+        self.wallpaper_luma = None;
         self.background_source = Some(desired.clone());
 
         if let Some(path) = &desired.file {
@@ -365,6 +397,12 @@ impl OpenKontaktEditor {
                 image
             };
             self.background_page = page_height(&image);
+            let luma = image.to_luma8();
+            self.wallpaper_luma = Some((
+                luma.width() as usize,
+                luma.height() as usize,
+                luma.as_raw().clone(),
+            ));
             let rgba = image.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -414,6 +452,16 @@ impl OpenKontaktEditor {
         self.ksp_values = values;
         self.ksp_slots = slots;
         self.ksp_labels = labels;
+
+        // Page tabs are a property of the instrument, so they only need rebuilding when it
+        // changes.
+        let instrument_path = loaded.instrument.source_path.display().to_string();
+        if self.ksp_tabs_path.as_deref() != Some(instrument_path.as_str()) {
+            self.ksp_tabs = ksp_panel_tabs(loaded);
+            self.ksp_active_slot = None;
+            self.ksp_tabs_path = Some(instrument_path);
+            self.ksp_scroll = 0.0;
+        }
 
         // Remember the panel as it stands, so a reload restores what the user set rather than
         // what the .nki was saved with. Keyed by instrument path: a different library must not
@@ -660,7 +708,7 @@ impl NiceEguiApp for OpenKontaktEditor {
         match self.view {
             ViewMode::Instrument => {
                 self.draw_sidebar(&p, &status, &setter);
-                self.draw_main(&p, &status, loaded.as_deref());
+                self.draw_main(&mut p, &status, loaded.as_deref());
             }
             ViewMode::Library => self.draw_library(&p),
         }
@@ -721,6 +769,41 @@ impl Painter<'_> {
             FontId::new(self.s(size), FontFamily::Proportional),
             color,
         );
+    }
+
+    /// Like [`Self::text`], but shrinks the font until the string fits `max_width` (design
+    /// pixels). Kontakt's panel font is a narrow pixel face; egui's proportional font is wider, so
+    /// without this the labels of neighbouring buttons run into each other.
+    #[allow(clippy::too_many_arguments)]
+    fn text_fit(
+        &self,
+        painter: &egui::Painter,
+        x: f32,
+        y: f32,
+        text: impl ToString,
+        size: f32,
+        color: Color32,
+        align: Align2,
+        max_width: f32,
+    ) {
+        let text = text.to_string();
+        let mut size = size;
+        loop {
+            let galley = painter.layout_no_wrap(
+                text.clone(),
+                FontId::new(self.s(size), FontFamily::Proportional),
+                color,
+            );
+            if galley.size().x <= max_width || size <= 5.0 {
+                painter.galley(
+                    align.anchor_size(self.pos(x, y), galley.size()).min,
+                    galley,
+                    color,
+                );
+                return;
+            }
+            size -= 0.4;
+        }
     }
 
     /// Text on its own translucent pill. Kontakt gives every knob caption its own backdrop, so the
@@ -1210,11 +1293,12 @@ impl OpenKontaktEditor {
 
     fn draw_main(
         &mut self,
-        p: &Painter<'_>,
+        p: &mut Painter<'_>,
         status: &LoadStatus,
         loaded: Option<&crate::state::LoadedInstrument>,
     ) {
-        let painter = p.ui.painter();
+        let painter_owned = p.ui.painter().clone();
+        let painter = &painter_owned;
         let main_x = SIDEBAR_WIDTH;
         let main_w = DESIGN_WIDTH - SIDEBAR_WIDTH;
 
@@ -1335,6 +1419,11 @@ impl OpenKontaktEditor {
         // Kontakt never stretches it horizontally, and the panel is the viewport, so the strip
         // that does not fit is cut from the top. That is what makes the controls line up with the
         // labels baked into the image — a top-anchored or cropped-to-fill image does not.
+        let (ksp_view, ksp_scroll, ksp_max_scroll) = self.ksp_scroll_state(p, art, loaded);
+        let skin_offset = self
+            .active_ksp_slot()
+            .and_then(|slot| loaded.and_then(|loaded| loaded.ksp.engine.skin_offset(slot)))
+            .unwrap_or(0.0);
         if let Some(texture) = &self.background {
             let ui_width = loaded.map_or(632.0, |loaded| {
                 loaded.instrument.ksp_panel.ui_width_px.max(1.0)
@@ -1388,17 +1477,21 @@ impl OpenKontaktEditor {
                     None => 0.0,
                 },
             };
+            self.wallpaper_shift_native = shift / scale;
             let page_sheet = shift > 0.0;
+            // The page a script selects with `set_skin_offset` starts that many image pixels
+            // further down the sheet, and the whole image scrolls with the controls.
             let image_top = if page_sheet {
                 panel.min.y - shift
             } else {
                 panel.max.y - image_height
-            };
+            } - skin_offset * scale
+                - ksp_scroll * p.scale;
             let image = Rect::from_min_size(
                 Pos2::new(art.min.x, image_top),
                 Vec2::new(image_size.x * scale, image_height),
             );
-            painter.with_clip_rect(panel).image(
+            painter.with_clip_rect(ksp_view).image(
                 texture.id(),
                 image,
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
@@ -1432,7 +1525,7 @@ impl OpenKontaktEditor {
         );
 
         if let Some(loaded) = loaded {
-            self.draw_ksp_panel(p, loaded, art);
+            self.draw_ksp_panel(p, loaded, art, ksp_view, ksp_scroll, ksp_max_scroll);
         } else {
             match status {
                 LoadStatus::Loading { path, started } => {
@@ -1599,47 +1692,80 @@ impl OpenKontaktEditor {
         );
     }
 
-    fn draw_ksp_panel(&mut self, p: &Painter<'_>, loaded: &LoadedInstrument, art: Rect) {
+    fn draw_ksp_panel(
+        &mut self,
+        p: &mut Painter<'_>,
+        loaded: &LoadedInstrument,
+        art: Rect,
+        view: Rect,
+        scroll: f32,
+        max_scroll: f32,
+    ) {
         self.menu_just_opened = false;
+        let previous_clip = p.ui.clip_rect();
+        p.ui.set_clip_rect(view);
+        self.draw_ksp_panel_inner(p, loaded, art, scroll, max_scroll);
+        p.ui.set_clip_rect(previous_clip);
+        let tabs = self.ksp_tabs.clone();
+        let active = self.ksp_active_slot;
+        self.draw_ksp_tabs(p, art, &tabs, active);
+    }
+
+    fn draw_ksp_panel_inner(
+        &mut self,
+        p: &Painter<'_>,
+        loaded: &LoadedInstrument,
+        art: Rect,
+        scroll: f32,
+        max_scroll: f32,
+    ) {
         let panel = &loaded.instrument.ksp_panel;
+        let active = self.active_ksp_slot();
         // Draw the *executed* state, not the declarations: scripts move and relabel controls from
-        // their callbacks, which is what makes a library panel animate.
-        let live: Vec<KspControl> = (0..loaded.ksp.slot_count())
-            .flat_map(|slot| loaded.ksp.controls(slot))
-            .map(|control| KspControl {
-                name: format!("${}", control.name),
-                kind: match control.kind {
-                    openkontakt::ksp::parser::UiKind::Knob => KspControlKind::Knob,
-                    openkontakt::ksp::parser::UiKind::Slider => KspControlKind::Slider,
-                    openkontakt::ksp::parser::UiKind::Label => KspControlKind::Label,
-                    openkontakt::ksp::parser::UiKind::Menu => KspControlKind::Menu,
-                    openkontakt::ksp::parser::UiKind::Switch => KspControlKind::Switch,
-                    openkontakt::ksp::parser::UiKind::Button => KspControlKind::Button,
-                    openkontakt::ksp::parser::UiKind::ValueEdit => KspControlKind::ValueEdit,
-                    openkontakt::ksp::parser::UiKind::Table => KspControlKind::Table,
-                },
-                label: control.label.clone(),
-                x: control.x,
-                y: control.y,
-                width: control.width,
-                height: control.height,
-                min: control.min,
-                max: control.max,
-                default: control.min,
-                value: control.value,
-                unit: control.unit.clone(),
-                persistent: control.persistent,
-                px: control.px,
-                picture: control.picture.clone(),
-                menu: control.menu.clone(),
-                mouse_behaviour: control.mouse_behaviour,
-                value_text: control.value_text.clone(),
-                pixel_width: control.pixel_width,
-                pixel_height: control.pixel_height,
-                table: control.table.clone(),
-                bar_color: control.bar_color,
-            })
-            .collect();
+        // their callbacks, which is what makes a library panel animate. Only the selected script
+        // slot's page is drawn — KONTAKT pages them instead of stacking every slot.
+        let live: Vec<KspControl> = match active {
+            Some(slot) => loaded.ksp.controls(slot),
+            None => (0..loaded.ksp.slot_count())
+                .flat_map(|slot| loaded.ksp.controls(slot))
+                .collect(),
+        }
+        .into_iter()
+        .map(|control| KspControl {
+            name: format!("${}", control.name),
+            kind: match control.kind {
+                openkontakt::ksp::parser::UiKind::Knob => KspControlKind::Knob,
+                openkontakt::ksp::parser::UiKind::Slider => KspControlKind::Slider,
+                openkontakt::ksp::parser::UiKind::Label => KspControlKind::Label,
+                openkontakt::ksp::parser::UiKind::Menu => KspControlKind::Menu,
+                openkontakt::ksp::parser::UiKind::Switch => KspControlKind::Switch,
+                openkontakt::ksp::parser::UiKind::Button => KspControlKind::Button,
+                openkontakt::ksp::parser::UiKind::ValueEdit => KspControlKind::ValueEdit,
+                openkontakt::ksp::parser::UiKind::Table => KspControlKind::Table,
+            },
+            label: control.label.clone(),
+            x: control.x,
+            y: control.y,
+            width: control.width,
+            height: control.height,
+            min: control.min,
+            max: control.max,
+            default: control.min,
+            value: control.value,
+            unit: control.unit.clone(),
+            persistent: control.persistent,
+            px: control.px,
+            picture: control.picture.clone(),
+            menu: control.menu.clone(),
+            mouse_behaviour: control.mouse_behaviour,
+            value_text: control.value_text.clone(),
+            pixel_width: control.pixel_width,
+            pixel_height: control.pixel_height,
+            table: control.table.clone(),
+            bar_color: control.bar_color,
+            hidden_parts: control.hidden_parts,
+        })
+        .collect();
         let controls: &[KspControl] = if live.is_empty() {
             &panel.controls
         } else {
@@ -1668,7 +1794,7 @@ impl OpenKontaktEditor {
         //   width = grid_w * 92 - 5, height = grid_h * 21 - 3
         let ksp_scale = (art.width() / p.scale) / panel.ui_width_px.max(1.0);
         let origin_x = art_x;
-        let origin_y = art_y;
+        let origin_y = art_y - scroll;
         let native = |x: f32, y: f32, w: f32, h: f32| {
             p.rect(
                 origin_x + x * ksp_scale,
@@ -1683,20 +1809,35 @@ impl OpenKontaktEditor {
             let control_rect = |control: &KspControl| {
                 // `move_control_px` positions a control in native pixels; `move_control` uses the
                 // fixed grid. Custom pictures have their own pixel footprint, not a grid cell.
-                let (w, h) = match (control.pixel_width, control.pixel_height) {
-                    // A picture button states its size explicitly; that is the hit area Kontakt
-                    // uses. Scripts often set only one of the two, so a zero is "unset".
-                    (Some(width), Some(height)) if width > 0 && height > 0 => {
-                        (width as f32, height as f32)
-                    }
-                    _ => match picture_frame_of(pictures, control) {
-                        Some(frame) => (frame.x, frame.y),
-                        None => match picture_size(control) {
-                            Some((w, h)) => (w, h),
-                            None => (
-                                control.width.max(1) as f32 * 92.0 - 5.0,
-                                control.height.max(1) as f32 * 21.0 - 3.0,
-                            ),
+                // A non-resizable sprite is drawn at its native size: 8Dio's dial labels are
+                // 52x23 sprites declared as 80x30 controls, and stretching them to the control
+                // made neighbouring labels run into each other.
+                let native_frame = picture_frame_of(pictures, control).filter(|_| {
+                    control
+                        .picture
+                        .as_deref()
+                        .and_then(|name| pictures.get(&name.to_ascii_lowercase()))
+                        .map(|resource| !resource.resizable)
+                        .unwrap_or(false)
+                });
+                let (w, h) = match native_frame {
+                    Some(frame) => (frame.x, frame.y),
+                    None => match (control.pixel_width, control.pixel_height) {
+                        // A picture button states its size explicitly; that is the hit area
+                        // Kontakt uses. Scripts often set only one of the two, so a zero is
+                        // "unset".
+                        (Some(width), Some(height)) if width > 0 && height > 0 => {
+                            (width as f32, height as f32)
+                        }
+                        _ => match picture_frame_of(pictures, control) {
+                            Some(frame) => (frame.x, frame.y),
+                            None => match picture_size(control) {
+                                Some((w, h)) => (w, h),
+                                None => (
+                                    control.width.max(1) as f32 * 92.0 - 5.0,
+                                    control.height.max(1) as f32 * 21.0 - 3.0,
+                                ),
+                            },
                         },
                     },
                 };
@@ -1709,110 +1850,177 @@ impl OpenKontaktEditor {
                 }
             };
 
-            for control in controls {
-                if !control.px && (control.x <= 0 && control.y <= 0) {
-                    continue;
-                }
-                let rect = control_rect(control);
-                // Controls the script has parked above the panel (a strip belonging to another
-                // page, or one moved to a negative position while hidden) must not spill over the
-                // header. Anything wholly outside the panel is skipped.
-                if !art.intersects(rect) {
-                    continue;
-                }
-                let value = self
-                    .ksp_values
-                    .iter()
-                    .find(|(name, _)| name == &control.name)
-                    .map(|(_, value)| *value)
-                    .unwrap_or_else(|| control.normalized_value());
-                self.draw_ksp_control(p, control, rect, ksp_scale);
-                let draggable = matches!(
-                    control.kind,
-                    KspControlKind::Knob | KspControlKind::Slider | KspControlKind::ValueEdit
-                );
-                // Picture buttons and switches are *controls*: a script that draws six of them is
-                // meant to be clicked. `Sense::hover` here made every button in a library panel
-                // inert.
-                let clickable = matches!(
-                    control.kind,
-                    KspControlKind::Button | KspControlKind::Switch | KspControlKind::Menu
-                );
-                let response = p.ui.interact(
-                    rect,
-                    p.ui.scope_id().with(("ksp", &control.name)),
-                    if draggable {
-                        Sense::click_and_drag()
-                    } else if clickable {
-                        Sense::click()
-                    } else {
-                        Sense::hover()
-                    },
-                );
-                if matches!(control.kind, KspControlKind::Menu) {
-                    if response.clicked() {
-                        menu_action = Some(control.name.clone());
-                        p.ui.ctx().request_repaint();
+            // KONTAKT draws `ui_value_edit` boxes beneath the picture controls, so a panel that
+            // parks a numeric field under a button hides it. Drawing them last put the
+            // keyswitch / CC fields of 8Dio's panel on top of the articulation artwork.
+            for value_edit_pass in [true, false] {
+                for control in controls {
+                    if matches!(control.kind, KspControlKind::ValueEdit) != value_edit_pass {
+                        continue;
                     }
-                } else if matches!(
-                    control.kind,
-                    KspControlKind::Button | KspControlKind::Switch
-                ) && response.clicked()
-                {
-                    if let Some((_, slot)) = self
-                        .ksp_slots
-                        .iter()
-                        .find(|(name, _)| name == &control.name)
-                    {
-                        // A button is momentary (the script decides what stays on, which is how
-                        // radio groups are built); a switch toggles.
-                        let value = if matches!(control.kind, KspControlKind::Button) {
-                            if control.value == 1 { 0 } else { 1 }
-                        } else {
-                            if control.value == 0 {
-                                control.max.max(1)
-                            } else {
-                                control.min
+                    if !control.px && (control.x <= 0 && control.y <= 0) {
+                        continue;
+                    }
+                    let mut rect = control_rect(control);
+                    // A playhead strip is a wide, short sprite repeated once per step. Rather than
+                    // trusting the script's y, park its bottom edge one pixel above the table's
+                    // top grid line (the same line the bars stop at), which is read from the
+                    // artwork.
+                    if control.px {
+                        if let Some(resource) = control
+                            .picture
+                            .as_deref()
+                            .and_then(|name| self.pictures.get(&name.to_ascii_lowercase()))
+                        {
+                            let is_strip = resource.frame.x >= 300.0 && resource.frame.y <= 10.0;
+                            if is_strip {
+                                if let Some(table) = controls.iter().find(|other| {
+                                    matches!(other.kind, KspControlKind::Table)
+                                        && (other.x - control.x).abs() <= 8
+                                        && other.y > control.y
+                                        && other.y - control.y <= 12
+                                }) {
+                                    let line = table.y as f32 + self.table_top_inset(table);
+                                    let strip_bottom = control.y as f32 + resource.frame.y;
+                                    let delta = line - 1.0 - strip_bottom;
+                                    rect =
+                                        rect.translate(Vec2::new(0.0, delta * ksp_scale * p.scale));
+                                }
                             }
-                        };
-                        loaded.ksp.set_control_value(
-                            *slot,
-                            control.name.trim_start_matches('$'),
-                            value,
-                        );
-                        p.ui.ctx().request_repaint();
+                        }
                     }
-                } else if draggable && (response.dragged() || response.clicked()) {
-                    if let Some((_, slot)) = self
-                        .ksp_slots
+                    // Controls the script has parked above the panel (a strip belonging to another
+                    // page, or one moved to a negative position while hidden) must not spill over the
+                    // header. Anything wholly outside the panel is skipped.
+                    if !art.intersects(rect) {
+                        continue;
+                    }
+                    let value = self
+                        .ksp_values
                         .iter()
                         .find(|(name, _)| name == &control.name)
-                    {
-                        let delta = if matches!(
-                            control.kind,
-                            KspControlKind::Knob | KspControlKind::ValueEdit
-                        ) {
-                            // Knobs follow a vertical drag, exactly like the plugin's own knobs
-                            // (and like Kontakt) instead of jumping to the pointer position.
-                            -response.drag_delta().y / p.s(150.0)
-                        } else if let Some(pos) = response.interact_pointer_pos() {
-                            // Sliders follow the pointer horizontally.
-                            ((pos.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) - value
+                        .map(|(_, value)| *value)
+                        .unwrap_or_else(|| control.normalized_value());
+                    self.draw_ksp_control(p, control, rect, ksp_scale);
+                    let draggable = matches!(
+                        control.kind,
+                        KspControlKind::Knob
+                            | KspControlKind::Slider
+                            | KspControlKind::ValueEdit
+                            | KspControlKind::Table
+                    );
+                    // Picture buttons and switches are *controls*: a script that draws six of them is
+                    // meant to be clicked. `Sense::hover` here made every button in a library panel
+                    // inert.
+                    let clickable = matches!(
+                        control.kind,
+                        KspControlKind::Button | KspControlKind::Switch | KspControlKind::Menu
+                    );
+                    let response = p.ui.interact(
+                        rect,
+                        p.ui.scope_id().with(("ksp", &control.name)),
+                        if draggable {
+                            Sense::click_and_drag()
+                        } else if clickable {
+                            Sense::click()
                         } else {
-                            0.0
-                        };
-                        if delta != 0.0 {
-                            let normalized = (value + delta).clamp(0.0, 1.0);
-                            loaded.ksp.set_control_normalized(
+                            Sense::hover()
+                        },
+                    );
+                    if matches!(control.kind, KspControlKind::Menu) {
+                        if response.clicked() {
+                            menu_action = Some(control.name.clone());
+                            p.ui.ctx().request_repaint();
+                        }
+                    } else if matches!(
+                        control.kind,
+                        KspControlKind::Button | KspControlKind::Switch
+                    ) && response.clicked()
+                    {
+                        if let Some((_, slot)) = self
+                            .ksp_slots
+                            .iter()
+                            .find(|(name, _)| name == &control.name)
+                        {
+                            // A button is momentary (the script decides what stays on, which is how
+                            // radio groups are built); a switch toggles.
+                            let value = if matches!(control.kind, KspControlKind::Button) {
+                                if control.value == 1 { 0 } else { 1 }
+                            } else {
+                                if control.value == 0 {
+                                    control.max.max(1)
+                                } else {
+                                    control.min
+                                }
+                            };
+                            loaded.ksp.set_control_value(
                                 *slot,
                                 control.name.trim_start_matches('$'),
-                                normalized,
+                                value,
                             );
                             p.ui.ctx().request_repaint();
                         }
+                    } else if matches!(control.kind, KspControlKind::Table)
+                        && (response.dragged() || response.clicked())
+                    {
+                        // A `ui_table` is edited in place: the pointer column picks the step and its
+                        // height sets the value, exactly like dragging bars in KONTAKT.
+                        if let (Some((_, slot)), Some(pos)) = (
+                            self.ksp_slots
+                                .iter()
+                                .find(|(name, _)| name == &control.name),
+                            response.interact_pointer_pos(),
+                        ) {
+                            let steps = control.table.len().max(1);
+                            let index = (((pos.x - rect.min.x) / rect.width().max(1.0))
+                                * steps as f32)
+                                .floor()
+                                .clamp(0.0, (steps - 1) as f32)
+                                as usize;
+                            let fraction =
+                                ((rect.max.y - pos.y) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                            let value = control.min
+                                + (fraction * (control.max - control.min) as f32).round() as i64;
+                            loaded.ksp.set_table_element(
+                                *slot,
+                                control.name.trim_start_matches('$'),
+                                index,
+                                value,
+                            );
+                            p.ui.ctx().request_repaint();
+                        }
+                    } else if draggable && (response.dragged() || response.clicked()) {
+                        if let Some((_, slot)) = self
+                            .ksp_slots
+                            .iter()
+                            .find(|(name, _)| name == &control.name)
+                        {
+                            let delta = if matches!(
+                                control.kind,
+                                KspControlKind::Knob | KspControlKind::ValueEdit
+                            ) {
+                                // Knobs follow a vertical drag, exactly like the plugin's own knobs
+                                // (and like Kontakt) instead of jumping to the pointer position.
+                                -response.drag_delta().y / p.s(150.0)
+                            } else if let Some(pos) = response.interact_pointer_pos() {
+                                // Sliders follow the pointer horizontally.
+                                ((pos.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0)
+                                    - value
+                            } else {
+                                0.0
+                            };
+                            if delta != 0.0 {
+                                let normalized = (value + delta).clamp(0.0, 1.0);
+                                loaded.ksp.set_control_normalized(
+                                    *slot,
+                                    control.name.trim_start_matches('$'),
+                                    normalized,
+                                );
+                                p.ui.ctx().request_repaint();
+                            }
+                        }
                     }
-                }
-                let _ = response.on_hover_text(format!(
+                    let _ = response.on_hover_text(format!(
                 "{}{}\nKSP grid: ({}, {})  ·  native cell {}×{}\nController value: {} / {} (raw)\nSet by the script's on ui_control handler.",
                 control.label,
                 control
@@ -1827,6 +2035,7 @@ impl OpenKontaktEditor {
                 control.value,
                 control.max
             ));
+                }
             }
         }
 
@@ -1835,6 +2044,7 @@ impl OpenKontaktEditor {
             self.open_menu = if opening { Some(name) } else { None };
             self.menu_just_opened = opening;
         }
+        self.draw_ksp_scroll(p, art, scroll, max_scroll);
         self.draw_menu_popup(p, loaded, art, ksp_scale);
 
         let badge = p.rect(
@@ -1945,6 +2155,7 @@ impl OpenKontaktEditor {
                 pixel_height: control.pixel_height,
                 table: control.table.clone(),
                 bar_color: control.bar_color,
+                hidden_parts: 0,
             },
         );
         let painter = p.ui.painter();
@@ -2009,8 +2220,324 @@ impl OpenKontaktEditor {
         }
     }
 
-    fn draw_ksp_control(&self, p: &Painter<'_>, control: &KspControl, cell: Rect, _ksp_scale: f32) {
+    /// The script slot whose page is on screen.
+    fn active_ksp_slot(&self) -> Option<usize> {
+        self.ksp_active_slot
+            .filter(|slot| self.ksp_tabs.iter().any(|(candidate, _)| candidate == slot))
+            .or_else(|| self.ksp_tabs.first().map(|(slot, _)| *slot))
+    }
+
+    /// Visible panel area (art minus the tab strip), the current scroll offset in design pixels
+    /// and how far the panel can scroll.
+    fn ksp_scroll_state(
+        &self,
+        p: &Painter<'_>,
+        art: Rect,
+        loaded: Option<&crate::state::LoadedInstrument>,
+    ) -> (Rect, f32, f32) {
+        let strip = if self.ksp_tabs.len() >= 2 {
+            p.s(16.0)
+        } else {
+            0.0
+        };
+        let view = Rect::from_min_max(art.min, Pos2::new(art.max.x, art.max.y - strip));
+        let Some(loaded) = loaded else {
+            return (view, 0.0, 0.0);
+        };
+        let panel = &loaded.instrument.ksp_panel;
+        let ksp_scale = (art.width() / p.scale) / panel.ui_width_px.max(1.0);
+        let view_height = view.height() / p.scale;
+        let content_height = panel.ui_height_px.max(1.0) * ksp_scale;
+        let max_scroll = (content_height - view_height).max(0.0);
+        (
+            view,
+            self.ksp_scroll.clamp(0.0, 1.0) * max_scroll,
+            max_scroll,
+        )
+    }
+
+    /// KONTAKT's panel scroll bar: a thin track on the right edge with a draggable thumb. Only
+    /// drawn when the native panel is taller than the area it is shown in.
+    fn draw_ksp_scroll(&mut self, p: &Painter<'_>, art: Rect, scroll: f32, max_scroll: f32) {
+        if max_scroll <= 0.5 {
+            return;
+        }
+        let strip = if self.ksp_tabs.len() >= 2 {
+            p.s(16.0)
+        } else {
+            0.0
+        };
+        let view = Rect::from_min_max(art.min, Pos2::new(art.max.x, art.max.y - strip));
         let painter = p.ui.painter();
+        let width = p.s(9.0);
+        let track = Rect::from_min_max(
+            Pos2::new(view.max.x - width + p.s(1.0), view.min.y + p.s(2.0)),
+            Pos2::new(view.max.x - p.s(2.0), view.max.y - p.s(2.0)),
+        );
+        painter.rect_filled(
+            track,
+            p.s(3.0),
+            Color32::from_rgba_unmultiplied(14, 14, 12, 170),
+        );
+
+        let total = view.height() + max_scroll * p.scale;
+        let thumb_height = (view.height() / total).clamp(0.08, 1.0) * track.height();
+        let travel = (track.height() - thumb_height).max(1.0);
+        let fraction = if max_scroll > 0.0 {
+            (scroll / max_scroll).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let thumb_top = track.min.y + travel * fraction;
+        let thumb = Rect::from_min_size(
+            Pos2::new(track.min.x + p.s(1.0), thumb_top),
+            Vec2::new(track.width() - p.s(2.0), thumb_height),
+        );
+        painter.rect_filled(thumb, p.s(3.0), Color32::from_rgb(96, 94, 88));
+
+        let response = p.ui.interact(
+            thumb,
+            p.ui.scope_id().with("ksp-scroll-thumb"),
+            Sense::drag(),
+        );
+        if response.dragged() {
+            self.ksp_scroll = (self.ksp_scroll + response.drag_delta().y / travel).clamp(0.0, 1.0);
+            p.ui.ctx().request_repaint();
+        }
+        if p.ui.rect_contains_pointer(view) {
+            // Only genuine wheel events: `smooth_scroll_delta` keeps easing for frames after
+            // one and would otherwise run the panel to its end on its own.
+            let wheel: f32 = p.ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                            egui::MouseWheelUnit::Point => delta.y,
+                            egui::MouseWheelUnit::Line => delta.y * 50.0,
+                            egui::MouseWheelUnit::Page => delta.y * 500.0,
+                        }),
+                        _ => None,
+                    })
+                    .sum()
+            });
+            if wheel != 0.0 {
+                let step = wheel / p.scale / max_scroll;
+                self.ksp_scroll = (self.ksp_scroll - step).clamp(0.0, 1.0);
+                p.ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    /// The tab strip KONTAKT shows under the panel when more than one script slot calls
+    /// `make_perfview`. Tabs are named after the slot descriptions stored in the .nki.
+    fn draw_ksp_tabs(
+        &mut self,
+        p: &Painter<'_>,
+        art: Rect,
+        tabs: &[(usize, String)],
+        active: Option<usize>,
+    ) {
+        if tabs.len() < 2 {
+            return;
+        }
+        let painter = p.ui.painter();
+        let height = p.s(16.0);
+        let bar = Rect::from_min_max(
+            Pos2::new(art.min.x, art.max.y - height),
+            Pos2::new(art.max.x, art.max.y),
+        );
+        painter.rect_filled(bar, 0.0, Color32::from_rgb(26, 26, 24));
+        painter.line_segment(
+            [bar.left_top(), bar.right_top()],
+            Stroke::new(1.0, Color32::from_rgb(58, 56, 50)),
+        );
+        let font = FontId::proportional(p.s(9.0));
+        let mut x = bar.min.x + p.s(3.0);
+        for (slot, name) in tabs {
+            let galley = painter.layout_no_wrap(name.clone(), font.clone(), TEXT);
+            let width = galley.size().x + p.s(16.0);
+            let tab = Rect::from_min_size(
+                Pos2::new(x, bar.min.y + p.s(2.0)),
+                Vec2::new(width, height - p.s(4.0)),
+            );
+            let selected = active == Some(*slot);
+            painter.rect_filled(
+                tab,
+                p.s(2.0),
+                if selected {
+                    Color32::from_rgb(58, 56, 50)
+                } else {
+                    Color32::from_rgb(33, 33, 30)
+                },
+            );
+            if !selected {
+                painter.rect_stroke(
+                    tab,
+                    p.s(2.0),
+                    Stroke::new(1.0, Color32::from_rgb(48, 47, 43)),
+                    StrokeKind::Inside,
+                );
+            }
+            let response = p.ui.interact(
+                tab,
+                p.ui.scope_id().with(("ksp-tab", *slot)),
+                Sense::click(),
+            );
+            if response.hovered() {
+                p.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                self.ksp_active_slot = Some(*slot);
+                p.ui.ctx().request_repaint();
+            }
+            painter.galley(
+                Pos2::new(
+                    tab.center().x - galley.size().x * 0.5,
+                    tab.center().y - galley.size().y * 0.5,
+                ),
+                galley,
+                if selected { TEXT } else { MUTED },
+            );
+            x += width + p.s(2.0);
+        }
+    }
+
+    /// Distance from a table's top edge to the first horizontal grid line the artwork draws, in
+    /// image pixels. Bars that reach full scale stop below that line instead of covering the
+    /// frame (and the step marker that sits above it).
+    fn table_top_inset(&self, control: &KspControl) -> f32 {
+        let Some((width, height, luma)) = self.wallpaper_luma.as_ref() else {
+            return 2.0;
+        };
+        if !control.px {
+            return 2.0;
+        }
+        let x0 = (control.x as usize + 2).min(*width);
+        let x1 = ((control.x + control.width.max(1) * 92 - 5) as usize).min(*width);
+        let y0 = (control.y as f32 + self.wallpaper_shift_native).max(0.0) as usize;
+        let span = control
+            .pixel_height
+            .filter(|value| *value > 0)
+            .unwrap_or(90) as usize;
+        let y1 = (y0 + span).min(*height);
+        if x1 <= x0 || y1 <= y0 + 2 {
+            return 2.0;
+        }
+        let rows: Vec<f32> = (y0..y1)
+            .map(|y| {
+                luma[y * width + x0..y * width + x1]
+                    .iter()
+                    .map(|value| *value as u32)
+                    .sum::<u32>() as f32
+                    / (x1 - x0) as f32
+            })
+            .collect();
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = sorted[sorted.len() / 2];
+        for (index, mean) in rows.iter().enumerate().take(rows.len() / 2) {
+            if *mean < median - 8.0 {
+                return (index + 1) as f32;
+            }
+        }
+        2.0
+    }
+
+    /// The vertical grid lines the wallpaper draws across a table, in image pixels.
+    ///
+    /// Libraries place a `ui_table` over artwork that already shows the grid, and the declared
+    /// control width is not always identical to the artwork's span — 8Dio's LFO table is 582
+    /// native pixels wide while the drawn grid is a little narrower. Reading the lines off the
+    /// wallpaper keeps the bars inside the cells instead of drifting across them.
+    fn table_grid_lines(
+        &self,
+        control: &KspControl,
+        cell: Rect,
+        scale: f32,
+    ) -> Option<(f32, Vec<f32>)> {
+        let (width, height, luma) = self.wallpaper_luma.as_ref()?;
+        if !control.px {
+            return None;
+        }
+        let native_x = control.x as f32;
+        let native_y = control.y as f32 + self.wallpaper_shift_native;
+        let native_w = control
+            .pixel_width
+            .filter(|value| *value > 0)
+            .unwrap_or(control.width.max(1) * 92 - 5) as f32;
+        let native_h = control
+            .pixel_height
+            .filter(|value| *value > 0)
+            .unwrap_or(control.height.max(1) * 21 - 3) as f32;
+        let origin_x = cell.min.x - native_x * scale;
+        let x0 = native_x.max(0.0) as usize;
+        let x1 = ((native_x + native_w) as usize).min(*width);
+        let y0 = native_y.max(0.0) as usize;
+        let y1 = ((native_y + native_h) as usize).min(*height);
+        if x1 <= x0 + 2 || y1 <= y0 + 2 {
+            return None;
+        }
+        let rows: Vec<usize> = (0..10)
+            .map(|step| y0 + (y1 - y0) * step / 10)
+            .filter(|row| *row < y1)
+            .collect();
+        let means: Vec<f32> = (x0..x1)
+            .map(|x| {
+                let total: u32 = rows.iter().map(|row| luma[row * width + x] as u32).sum();
+                total as f32 / rows.len().max(1) as f32
+            })
+            .collect();
+        let median = {
+            let mut sorted = means.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted[sorted.len() / 2]
+        };
+        let mut found: Vec<Vec<usize>> = Vec::new();
+        for index in 3..means.len().saturating_sub(3) {
+            let value = means[index];
+            if value <= means[index - 3] - 4.0
+                && value <= means[index + 3] - 4.0
+                && value < median - 4.0
+            {
+                let centre = x0 + index;
+                match found.last_mut() {
+                    Some(last) if centre - last[last.len() - 1] <= 4 => last.push(centre),
+                    _ => found.push(vec![centre]),
+                }
+            }
+        }
+        if found.len() < 3 {
+            return None;
+        }
+        let mut lines: Vec<f32> = found
+            .iter()
+            .map(|run| run.iter().sum::<usize>() as f32 / run.len() as f32)
+            .collect();
+        // The first and last lines sit on the panel's inner border and are often too dark to be
+        // picked as local minima. Rebuild them from the measured spacing instead of losing a
+        // whole cell at either end.
+        let mut gaps: Vec<f32> = lines.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let step = gaps[gaps.len() / 2];
+        if step <= 0.5 {
+            return None;
+        }
+        if lines[0] - native_x > step * 0.5 {
+            lines.insert(0, lines[0] - step);
+        }
+        let right = native_x + native_w;
+        if right - lines[lines.len() - 1] > step * 0.5 {
+            lines.push(lines[lines.len() - 1] + step);
+        }
+        Some((origin_x, lines))
+    }
+
+    fn draw_ksp_control(&self, p: &Painter<'_>, control: &KspControl, cell: Rect, ksp_scale: f32) {
+        let painter = p.ui.painter();
+        // The panel is a native-pixel canvas: everything KONTAKT draws on it — text, knobs,
+        // margins — scales with the same factor as the control rectangles.
+        let k = ksp_scale.max(0.1);
         let value = self
             .ksp_values
             .iter()
@@ -2035,6 +2562,10 @@ impl OpenKontaktEditor {
             if draw_picture_control(p, picture, cell, value, control_label.as_str()) {
                 return;
             }
+            // A picture this library references but does not ship (KONTAKT's built-in skins, or
+            // a "Null" sprite used to hide a control) draws nothing at all. Inventing a default
+            // knob here added controls the original panel does not have.
+            return;
         }
 
         match control.kind {
@@ -2046,17 +2577,19 @@ impl OpenKontaktEditor {
                     p.s(2.0),
                     Color32::from_rgba_unmultiplied(20, 16, 12, 190),
                 );
-                p.text(
+                let max_width = (cell.width() / p.scale - 10.0 * k).max(12.0);
+                p.text_fit(
                     painter,
-                    cell.min.x / p.scale - p.origin.x / p.scale + 8.0,
+                    cell.min.x / p.scale - p.origin.x / p.scale + 8.0 * k,
                     cell.center().y / p.scale - p.origin.y / p.scale,
                     control_label.clone(),
-                    9.0,
+                    9.0 * k,
                     // Every label is drawn in the same ink. Kontakt has no per-label colour, and
                     // the old "highlight anything called 'mic'" rule made one heading in a panel
                     // look selected for no reason.
                     TEXT,
                     Align2::LEFT_CENTER,
+                    max_width,
                 );
             }
             KspControlKind::Table => {
@@ -2067,40 +2600,113 @@ impl OpenKontaktEditor {
                     return;
                 }
                 let count = steps.len();
-                let peak = steps.iter().copied().max().unwrap_or(1).max(1) as f32;
+                // Stop full-scale bars below the artwork's top grid line: the frame and the step
+                // marker above it must stay visible.
+                let top_inset = p.s(self.table_top_inset(control) * ksp_scale);
+                // Bars are drawn against the table's declared maximum, not the loudest step:
+                // KONTAKT's grids are fixed-scale, and auto-scaling made a quiet table look full.
+                let peak = control.max.max(1) as f32;
                 let bar = cell.width() / count as f32;
                 let colour = control
                     .bar_color
                     .map(|value| {
-                        let red = (value & 0xff) as u8;
+                        // KSP colour constants are 0xRRGGBB.
+                        let red = ((value >> 16) & 0xff) as u8;
                         let green = ((value >> 8) & 0xff) as u8;
-                        let blue = ((value >> 16) & 0xff) as u8;
+                        let blue = (value & 0xff) as u8;
                         Color32::from_rgb(red, green, blue)
                     })
                     .unwrap_or(ACCENT);
+                // Snap to the artwork's own grid when it can be read; the table's declared width
+                // and the drawn grid do not always agree.
+                let detected = self.table_grid_lines(control, cell, ksp_scale * p.scale);
+                let stride = detected.as_ref().map(|(_, lines)| {
+                    let mut gaps: Vec<f32> =
+                        lines.windows(2).map(|pair| pair[1] - pair[0]).collect();
+                    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let line_step = gaps[gaps.len() / 2].max(0.5);
+                    // How many artwork lines one table step spans (usually one).
+                    let cell = bar / (ksp_scale * p.scale);
+                    ((cell / line_step).round() as usize).max(1)
+                });
                 for (index, step) in steps.iter().enumerate() {
                     let level = (*step as f32 / peak).clamp(0.0, 1.0);
                     if level <= 0.0 {
                         continue;
                     }
-                    let height = cell.height() * level;
-                    let x = cell.min.x + bar * index as f32;
+                    let height = (cell.height() - top_inset).max(1.0) * level;
+                    let (x, width) = match (&detected, stride) {
+                        (Some((origin, lines)), Some(stride)) if lines.len() > stride => {
+                            let from = index * stride;
+                            let to = (from + stride).min(lines.len() - 1);
+                            if to <= from {
+                                continue;
+                            }
+                            // The artwork's line is drawn on the cell boundary; start one pixel
+                            // to its right so the bar sits inside the cell.
+                            let left = origin + lines[from] * ksp_scale * p.scale + 1.0;
+                            let right = origin + lines[to] * ksp_scale * p.scale;
+                            (left, (right - left).max(1.0))
+                        }
+                        _ => {
+                            let x = cell.min.x + bar * index as f32;
+                            (x, (bar - 1.0).max(1.0))
+                        }
+                    };
                     painter.rect_filled(
                         Rect::from_min_size(
                             Pos2::new(x, cell.max.y - height),
-                            Vec2::new(bar * 0.85, height),
+                            Vec2::new(width, height),
                         ),
                         0.0,
                         colour,
                     );
                 }
             }
-            KspControlKind::Knob | KspControlKind::ValueEdit => {
+            KspControlKind::ValueEdit => {
+                // A `ui_value_edit` is a small numeric field, not a knob. Drawing a knob here put
+                // 8Dio's keyswitch / CC fields on top of the articulation buttons.
+                if control.hidden_parts & (16 | 1) != 0 {
+                    // `hide_part(..., $HIDE_PART_BG)` means the number is a read-out meant to sit
+                    // on artwork; without that artwork it just looks like a stray digit (8Dio's
+                    // KEY / CC fields), so it stays hidden like in KONTAKT.
+                    return;
+                }
+                let field = cell.shrink2(Vec2::new(p.s(2.0 * k), p.s(2.0 * k)));
+                if control.hidden_parts & 1 == 0 {
+                    painter.rect_filled(
+                        field,
+                        p.s(2.0 * k),
+                        Color32::from_rgba_unmultiplied(18, 18, 18, 200),
+                    );
+                    painter.rect_stroke(
+                        field,
+                        p.s(2.0 * k),
+                        Stroke::new(1.0, LINE),
+                        StrokeKind::Inside,
+                    );
+                }
+                let text = control
+                    .value_text
+                    .clone()
+                    .unwrap_or_else(|| control.value.to_string());
+                p.text_fit(
+                    painter,
+                    field.center().x / p.scale - p.origin.x / p.scale,
+                    field.center().y / p.scale - p.origin.y / p.scale,
+                    text,
+                    9.0 * k,
+                    TEXT,
+                    Align2::CENTER_CENTER,
+                    (field.width() / p.scale - 4.0 * k).max(8.0),
+                );
+            }
+            KspControlKind::Knob => {
                 let cell_left = cell.min.x / p.scale - p.origin.x / p.scale;
                 let cell_top = cell.min.y / p.scale - p.origin.y / p.scale;
                 let knob_rect = Rect::from_center_size(
-                    p.pos(cell_left + 24.0, cell_top + 24.0),
-                    Vec2::splat(p.s(34.0)),
+                    p.pos(cell_left + 24.0 * k, cell_top + 24.0 * k),
+                    Vec2::splat(p.s(34.0 * k)),
                 );
                 // A knob with `$CONTROL_PAR_PICTURE` is a sprite like any other control: the
                 // library ships the artwork and the script picked a frame per value. Drawing the
@@ -2114,9 +2720,10 @@ impl OpenKontaktEditor {
                     painter,
                     p,
                     knob_rect,
-                    cell_left + 50.0,
+                    cell_left + 50.0 * k,
                     truncate(&control_label, 14),
                     control.value_text.clone(),
+                    k,
                 );
             }
             KspControlKind::Slider => {
@@ -2220,11 +2827,11 @@ impl OpenKontaktEditor {
                 ));
             }
             KspControlKind::Menu => {
-                let box_rect = cell.shrink2(Vec2::new(p.s(4.0), p.s(7.0)));
-                painter.rect_filled(box_rect, p.s(3.0), Color32::from_rgb(39, 37, 32));
+                let box_rect = cell.shrink2(Vec2::new(p.s(4.0 * k), p.s(7.0 * k)));
+                painter.rect_filled(box_rect, p.s(3.0 * k), Color32::from_rgb(39, 37, 32));
                 painter.rect_stroke(
                     box_rect,
-                    p.s(3.0),
+                    p.s(3.0 * k),
                     Stroke::new(1.0, LINE),
                     StrokeKind::Inside,
                 );
@@ -2235,32 +2842,34 @@ impl OpenKontaktEditor {
                     .unwrap_or_else(|| control_label.clone());
                 p.text(
                     painter,
-                    box_rect.min.x / p.scale - p.origin.x / p.scale + 7.0,
+                    box_rect.min.x / p.scale - p.origin.x / p.scale + 7.0 * k,
                     box_rect.center().y / p.scale - p.origin.y / p.scale,
                     truncate(&selected, 22),
-                    8.0,
+                    8.0 * k,
                     TEXT,
                     Align2::LEFT_CENTER,
                 );
                 p.text(
                     painter,
-                    box_rect.max.x / p.scale - p.origin.x / p.scale - 7.0,
+                    box_rect.max.x / p.scale - p.origin.x / p.scale - 7.0 * k,
                     box_rect.center().y / p.scale - p.origin.y / p.scale,
                     "▾",
-                    9.0,
+                    9.0 * k,
                     MUTED,
                     Align2::RIGHT_CENTER,
                 );
             }
             KspControlKind::Switch | KspControlKind::Button => {
-                p.text(
+                let max_width = (cell.width() / p.scale - 16.0 * k).max(12.0);
+                p.text_fit(
                     painter,
-                    cell.min.x / p.scale - p.origin.x / p.scale + 8.0,
+                    cell.min.x / p.scale - p.origin.x / p.scale + 8.0 * k,
                     cell.center().y / p.scale - p.origin.y / p.scale,
                     truncate(&control.label, 16),
-                    8.0,
+                    8.0 * k,
                     MUTED,
                     Align2::LEFT_CENTER,
+                    max_width,
                 );
             }
             KspControlKind::Other => {}
@@ -3149,6 +3758,32 @@ fn draw_mini_knob(
 /// The name and readout beside a KSP knob: two translucent bars whose left edge follows the
 /// knob's curvature (without touching it) and whose right edges line up, as in KONTAKT. Their
 /// heights keep KONTAKT's 16 : 5 : 16 proportion.
+/// Script slots that call `make_perfview`, i.e. the pages KONTAKT lists in its tab strip. Slots
+/// that only declare utility controls (a velocity-curve editor, for instance) are not listed.
+fn ksp_panel_tabs(loaded: &LoadedInstrument) -> Vec<(usize, String)> {
+    loaded
+        .instrument
+        .scripts
+        .iter()
+        .filter(|slot| !slot.bypass)
+        .filter_map(|slot| {
+            let text = slot.text.as_deref()?;
+            if !text.contains("make_perfview") {
+                return None;
+            }
+            let name = slot
+                .description
+                .as_deref()
+                .filter(|name| !name.is_empty() && *name != "<empty>")?;
+            if loaded.ksp.controls(slot.index).is_empty() {
+                return None;
+            }
+            Some((slot.index, name.to_string()))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ksp_knob_caption(
     painter: &egui::Painter,
     p: &Painter<'_>,
@@ -3156,6 +3791,7 @@ fn ksp_knob_caption(
     text_left: f32,
     label: String,
     value_text: Option<String>,
+    k: f32,
 ) {
     // `text_left` arrives in design units; everything below works in physical pixels, and the
     // window's fit-to-size scale changes when it is resized.
@@ -3163,9 +3799,9 @@ fn ksp_knob_caption(
     let bar_height = knob_rect.height() * 16.0 / 37.0;
     let gap = knob_rect.height() * 5.0 / 37.0;
 
-    let label_galley = painter.layout_no_wrap(label, FontId::proportional(p.s(10.0)), TEXT);
-    let value_galley =
-        value_text.map(|text| painter.layout_no_wrap(text, FontId::proportional(p.s(9.0)), TEXT));
+    let label_galley = painter.layout_no_wrap(label, FontId::proportional(p.s(10.0 * k)), TEXT);
+    let value_galley = value_text
+        .map(|text| painter.layout_no_wrap(text, FontId::proportional(p.s(9.0 * k)), TEXT));
     let text_width = value_galley
         .as_ref()
         .map(|galley| galley.size().x.max(label_galley.size().x))
