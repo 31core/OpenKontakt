@@ -95,14 +95,28 @@ pub fn render(
     let loaded_bytes = loaded.bytes_loaded;
     let mapped_bytes = loaded.bytes_mapped;
     let threaded = std::env::var("OPENKONTAKT_THREADED").is_ok();
+    let loaded = Arc::new(loaded);
     if threaded {
-        engine.set_instrument(Some(Arc::new(loaded)));
+        engine.set_instrument(Some(Arc::clone(&loaded)));
     } else {
-        engine.set_instrument_blocking(Arc::new(loaded));
+        engine.set_instrument_blocking(Arc::clone(&loaded));
     }
     // Same reason as the interpreter: the impulse response is built here, not on a loader thread,
     // so the render is deterministic and the reverb is present from the first sample.
     engine.load_rack_ir_blocking();
+    // Panel controls can be pressed before rendering, which is how an effect switch that only
+    // exists behind a KSP `on ui_control` handler is exercised without a UI.
+    if let Ok(name) = std::env::var("OPENKONTAKT_PRESS") {
+        let value: i64 = std::env::var("OPENKONTAKT_PRESS_VALUE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        for slot in 0..loaded.ksp.slot_count() {
+            if loaded.ksp.set_control_value(slot, &name, value) {
+                eprintln!("debug: pressed {name}={value} on slot {slot}");
+            }
+        }
+    }
     if std::env::var("OPENKONTAKT_NO_REVERB").is_ok() {
         engine.disable_reverb();
     }

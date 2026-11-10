@@ -1085,6 +1085,14 @@ impl<'a> Interp<'a> {
                     .set_engine_par(&param, value, group, slot, generic);
                 Ok(Value::Int(0))
             }
+            "find_mod" => {
+                // Kontakt looks up a modulator by type and engine name. No modulator data is
+                // stored anywhere this reader parses — one library's `LFO_SINE` modulator
+                // does not exist in its file — so nothing can be found and -1 is the answer the
+                // script has to cope with. Without this the unknown-function fallback returned 0,
+                // which pointed every `set_engine_par(..., find_mod(...), ...)` at slot 0.
+                Ok(Value::Int(-1))
+            }
             "get_engine_par" => {
                 let param = symbol_arg(0).unwrap_or_default();
                 let group = self.eval_arg(args, 1)?;
@@ -1431,7 +1439,7 @@ impl<'a> Interp<'a> {
             // `num_elements(array)` is how a script walks a group list. Without it every
             // `while ($a < num_elements(%groups))` loop runs zero times, so a script that pairs
             // `disallow_group($ALL_GROUPS)` with a loop of `allow_group(...)` allows nothing and
-            // the instrument plays silently. 8Dio's 1928 Piano is exactly that shape.
+            // the instrument plays silently. one piano library is exactly that shape.
             "num_elements" => {
                 let name = match args.first() {
                     // An array's name keeps its `%`, as with `search`.
@@ -1532,7 +1540,7 @@ fn binary(op: BinOp, left: Value, right: Value) -> Value {
 
 /// KSP's volume controller uses `630000` as unity gain, `0` as silence and `1_000_000` as the top
 /// of the range. Between those points it is linear in decibels: -60 dB at 0, 0 dB at 630 000 and
-/// +12 dB at 1 000 000. Library panels rely on this — NFO's saved "stereo pair" is 630 000 and its
+/// +12 dB at 1 000 000. Library panels rely on this — one library's saved "stereo pair" is 630 000 and its
 /// other microphones default to 0.
 fn volume_to_gain(value: i64) -> f32 {
     let value = value.clamp(0, 1_000_000) as f32 / 1_000_000.0;
@@ -1699,7 +1707,13 @@ impl KspRuntime {
             let bare = name.trim_start_matches('$');
             if let Some(control) = state.ui.iter_mut().find(|c| c.name == bare) {
                 control.value = first;
-                changed.push(bare.to_string());
+                // A `ui_button` handler runs on a click, not on a restore. One panel's three
+                // direction buttons each `call all_off1` and then set themselves to 1 whoever fires,
+                // so replaying them turned the stored first-button selection into the last one.
+                // Switches and knobs do need the replay — engine state hangs off them.
+                if control.kind != UiKind::Button {
+                    changed.push(bare.to_string());
+                }
             }
             let is_array = values.len() > 1;
             if is_array {
@@ -1750,7 +1764,7 @@ impl KspRuntime {
             }
         }
         // Re-running the handlers is how the engine mirrors saved knob positions, but a handler
-        // can also assign other saved variables as a side effect: 8Dio's articulation selectors
+        // can also assign other saved variables as a side effect: one library's articulation selectors
         // set `$Current_Art`, and the last one to run wins, which left the instrument on
         // articulation 24 instead of the saved 1 and playing nothing. Put the saved variables back.
         for (name, values) in entries {
@@ -2227,7 +2241,7 @@ mod tests {
     }
 
     /// Restoring a saved instrument must not let a replayed `on ui_control` handler overwrite
-    /// another saved variable. 8Dio's articulation selectors all assign `$Current_Art`, so the
+    /// another saved variable. one library's articulation selectors all assign `$Current_Art`, so the
     /// last handler to run left it on articulation 24 instead of the saved 1 and nothing played.
     #[test]
     fn a_replayed_handler_does_not_overwrite_a_saved_variable() {

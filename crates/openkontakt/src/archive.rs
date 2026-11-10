@@ -150,7 +150,7 @@ pub fn archive_from_index(bytes: &[u8], index: &crate::nkc::NkcIndex) -> Option<
 
 pub fn parse_resource_archive(bytes: &[u8]) -> ResourceArchive {
     // The directory lives in front of the first payload block, and an archive can be hundreds of
-    // megabytes (8Dio's `Resources.nkr` is 113 MB, mostly sample data). Every scan below is
+    // megabytes (one library's `Resources.nkr` is 113 MB, mostly sample data). Every scan below is
     // therefore bounded to that header region: searching the whole file once per name turned a
     // load into a two-and-a-half minute freeze.
     let header_end = find_block(bytes, 0).unwrap_or(bytes.len()).min(bytes.len());

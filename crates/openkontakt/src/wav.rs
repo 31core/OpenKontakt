@@ -888,7 +888,7 @@ mod tests {
         }
     }
 
-    /// 24-bit is the format every NFO sample uses; a missing sign extension turns a string section
+    /// 24-bit is the format the corpus uses; a missing sign extension turns a string section
     /// into loud noise.
     #[test]
     fn twenty_four_bit_keeps_sign_and_scale() {

@@ -299,8 +299,8 @@ impl OpenKontaktEditor {
                 continue;
             };
             // A sprite sheet taller than the GPU's maximum texture side is legal to ship and
-            // impossible to upload: 8Dio's `Long_Fader` is 12 × 32 967. Scaling the sheet keeps
-            // every proportion the panel uses, because frames are addressed as UV fractions.
+            // impossible to upload: one library's `Long_Fader` is 12 × 32 967. Scaling the sheet
+            // keeps every proportion the panel uses, since frames are addressed as UV fractions.
             let image = if image.width() > MAX_TEXTURE_SIDE || image.height() > MAX_TEXTURE_SIDE {
                 let scale =
                     (MAX_TEXTURE_SIDE as f32 / image.width().max(image.height()) as f32).min(1.0);
@@ -1452,13 +1452,13 @@ impl OpenKontaktEditor {
             let image_height = image_size.y * scale;
             // A wallpaper a little taller than the panel is the panel's own artwork with its
             // edges bleeding over, and it is pinned to the bottom: that is what keeps the controls
-            // on the labels baked into the image (The Experience's Ambi panel is 633 × 329 in a
+            // on the labels baked into the image (one panel is 633 × 329 in a
             // 260 px view).
             // A wallpaper that repeats its first rows is a sheet of stacked pages, and the panel
-            // shows one page centred on itself: 8Dio's page is 668 px tall for a 536 px view, so the
-            // view starts 66 px into the page. A wallpaper that is merely a little taller than the
+            // shows one page centred on itself: one library's page is 668 px tall for a 536 px
+            // view, so the view starts 66 px into the page. A wallpaper that is merely a little taller than the
             // panel is the panel's own artwork with a few pixels of bleed and stays pinned to the
-            // bottom, which is what keeps The Experience's Ambi labels under their controls.
+            // bottom, which is what keeps that library's labels under their controls.
             // `OPENKONTAKT_WALLPAPER_SHIFT` overrides the derived offset, so a value can be
             // compared against the reference without rebuilding. Remove once the rule is settled.
             let shift = match std::env::var("OPENKONTAKT_WALLPAPER_SHIFT")
@@ -1470,8 +1470,8 @@ impl OpenKontaktEditor {
                     .background_page
                     .filter(|_| image_height > panel.height() * 1.5)
                 {
-                    // The page is centred in the panel: 8Dio's page is 668 px for a 536 px view,
-                    // which puts the visible band at 66..602 — the reference's alignment within a
+                    // The page is centred in the panel: one library's page is 668 px for a 536 px
+                    // view, which puts the visible band at 66..602 — the reference's alignment within a
                     // couple of pixels.
                     Some(page) => (((page as f32 - ui_height) / 2.0).max(0.0)) * scale,
                     None => 0.0,
@@ -1809,7 +1809,7 @@ impl OpenKontaktEditor {
             let control_rect = |control: &KspControl| {
                 // `move_control_px` positions a control in native pixels; `move_control` uses the
                 // fixed grid. Custom pictures have their own pixel footprint, not a grid cell.
-                // A non-resizable sprite is drawn at its native size: 8Dio's dial labels are
+                // A non-resizable sprite is drawn at its native size: one library's dial labels are
                 // 52x23 sprites declared as 80x30 controls, and stretching them to the control
                 // made neighbouring labels run into each other.
                 let native_frame = picture_frame_of(pictures, control).filter(|_| {
@@ -1852,7 +1852,7 @@ impl OpenKontaktEditor {
 
             // KONTAKT draws `ui_value_edit` boxes beneath the picture controls, so a panel that
             // parks a numeric field under a button hides it. Drawing them last put the
-            // keyswitch / CC fields of 8Dio's panel on top of the articulation artwork.
+            // keyswitch / CC fields of that panel on top of the articulation artwork.
             for value_edit_pass in [true, false] {
                 for control in controls {
                     if matches!(control.kind, KspControlKind::ValueEdit) != value_edit_pass {
@@ -2447,7 +2447,7 @@ impl OpenKontaktEditor {
     /// The vertical grid lines the wallpaper draws across a table, in image pixels.
     ///
     /// Libraries place a `ui_table` over artwork that already shows the grid, and the declared
-    /// control width is not always identical to the artwork's span — 8Dio's LFO table is 582
+    /// control width is not always identical to the artwork's span — one library's LFO table is 582
     /// native pixels wide while the drawn grid is a little narrower. Reading the lines off the
     /// wallpaper keeps the bars inside the cells instead of drifting across them.
     fn table_grid_lines(
@@ -2665,10 +2665,10 @@ impl OpenKontaktEditor {
             }
             KspControlKind::ValueEdit => {
                 // A `ui_value_edit` is a small numeric field, not a knob. Drawing a knob here put
-                // 8Dio's keyswitch / CC fields on top of the articulation buttons.
+                // that library's keyswitch / CC fields on top of the articulation buttons.
                 if control.hidden_parts & (16 | 1) != 0 {
                     // `hide_part(..., $HIDE_PART_BG)` means the number is a read-out meant to sit
-                    // on artwork; without that artwork it just looks like a stray digit (8Dio's
+                    // on artwork; without that artwork it just looks like a stray digit (one library's
                     // KEY / CC fields), so it stays hidden like in KONTAKT.
                     return;
                 }

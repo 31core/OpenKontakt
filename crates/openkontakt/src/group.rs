@@ -45,7 +45,7 @@ impl Group {
     ///
     /// A record of one byte (`00`) means "no criteria" and never cycles, which is the common case.
     ///
-    /// Libraries: Pianobook's Soft Steinway (2 groups) and NFO's Chamber Strings (8 groups — four
+    /// Seen: one library with 2 groups and another with 8 (four
     /// microphones, each with an RR1 and an RR2 sharing one record).
     pub fn round_robin(&self) -> Option<(u32, Vec<u8>)> {
         let body = self

@@ -39,10 +39,10 @@ impl Default for Ahdsr {
 
 /// Envelope time mapping used both by the engine and by `get_engine_par_disp`: 0 ms at 0,
 /// five seconds at 1, cubic in between. Kontakt's own law is not in the file, so a player picks one;
-/// this one makes NFO's stored 500 ms land near the middle of the knob, which is where the
+/// this one makes one library's stored 500 ms land near the middle of the knob, which is where the
 /// original panel draws it.
-/// The law is anchored on the one mapping the corpus pins down: NFO stores a 500 ms decay and the
-/// panel persists a controller value of 586 069 for that same envelope, so `0.586` must read as
+/// The law is anchored on the one mapping the corpus pins down: one library stores a 500 ms decay
+/// and the panel persists a controller value of 586 069 for that same envelope, so `0.586` reads as
 /// 500 ms. Below that point the curve is quadratic, above it exponential up to 20 s at 1.0 — the
 /// same shape Kontakt's envelope knobs have (fine control at the short end).
 const ANCHOR_V: f32 = 0.586;

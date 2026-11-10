@@ -729,7 +729,7 @@ pub fn load_samples(instrument: &Instrument) -> LoadedSamples {
         // Stream the file: mapping keeps 10 GB libraries off the heap, and the instrument's DFD
         // preload setting decides how much is touched up front.
         // `dfd_preload` is Kontakt's preload buffer size in *bytes* (60 KiB by default, 240 KiB on
-        // 8Dio's 1928 Piano), not a frame count.
+        // one piano library), not a frame count.
         let preload = instrument.program.params.dfd_preload.max(0) as usize;
         let loose = instrument.resolved_samples.get(&id);
         // A packed library has no loose file: the audio is a `.ncw` inside an `.nkx`/`.nkr` and
@@ -1008,7 +1008,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 8Dio writes its impulse responses as `<package>.nkr/<path inside the package>`.
+    /// Some libraries write their impulse responses as `<package>.nkr/<path inside the package>`.
     fn archive_with(name: &str, data: &[u8]) -> crate::archive::ResourceArchive {
         crate::archive::ResourceArchive {
             entries: vec![crate::archive::ArchiveEntry {

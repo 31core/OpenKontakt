@@ -20,7 +20,7 @@
 //! A record's **tail comes before its name**, and the first entry's tail sits directly after the
 //! root's name. The file therefore ends on a name, with no trailing tail. Reading name-first shifts
 //! every entry by one without producing anything implausible; the offset then belongs to the next
-//! entry, which is only visible when a payload is compared with the name that claims it (8Dio's
+//! entry, which is only visible when a payload is compared with the name that claims it (one library's
 //! `1_Art_1.PNG` pointed at a text sidecar, and 0 of 520 names matched their payload).
 
 use crate::error::{Error, Result};
@@ -166,7 +166,7 @@ fn read_entries(bytes: &[u8], mut at: usize) -> Result<Vec<NkcEntry>> {
     // entry by one, so each offset then carries the next entry's name. That still parses cleanly
     // and still yields plausible offsets, which is why it survived: nothing looks wrong until a
     // payload is compared against the name that claims it. The tell was this parser's own note
-    // that 8Dio's catalogue "ends with a name and no tail" — with the tail first, a name is exactly
+    // that one catalogue "ends with a name and no tail" — with the tail first, a name is exactly
     // how the file ends.
     while at + TAIL_LEN <= bytes.len() {
         let (offset, size, kind) = read_tail(bytes, at);

@@ -207,6 +207,10 @@ pub struct Engine {
     master_tune_semitones: f64,
     /// Program insert rack, in slot order. Built once when the instrument loads.
     insert_chain: Vec<fx::Fx>,
+    /// Slot bypasses as the script last set them, so a change can rebuild the chain.
+    insert_bypass: std::collections::HashMap<usize, bool>,
+    /// Counts traced samples so `OPENKONTAKT_TRACE` prints a handful, not millions.
+    trace_count: usize,
     /// One AHDSR per group, read from the internal-modulator array.
     group_envelopes: Vec<Ahdsr>,
     /// Values the script currently asks for, so a running filter is retuned only when they move.
@@ -252,6 +256,8 @@ impl Default for Engine {
             current: None,
             master_tune_semitones: 0.0,
             insert_chain: Vec::new(),
+            insert_bypass: std::collections::HashMap::new(),
+            trace_count: 0,
             group_envelopes: Vec::new(),
             filter_cutoff: 1.0,
             filter_resonance: 0.0,
@@ -342,7 +348,7 @@ impl Engine {
                     ModuleParams::Convolution { ir_index } => {
                         // The send is left to the script (`$ENGINE_PAR_SENDLEVEL_n`). Reading it
                         // from the program's send matrix looked right on paper but made every
-                        // render wetter than Kontakt's: The Experience's reference output is dry —
+                        // render wetter than Kontakt's: one library's reference output is dry —
                         // it has six consecutive 100 ms windows of digital silence at 247 s, which
                         // no reverb tail can produce — so the matrix does not mean what the field
                         // layout suggests.
@@ -377,7 +383,22 @@ impl Engine {
         let Some(rack) = racks.first() else {
             return;
         };
-        self.insert_chain = fx::build_chain(&rack.slots, self.sample_rate);
+        let mut overrides = std::collections::HashMap::new();
+        for (index, slot) in rack.slots.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            if let Some(value) =
+                loaded
+                    .ksp
+                    .engine
+                    .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, 0)
+            {
+                overrides.insert(index, value != 0);
+            }
+        }
+        self.insert_bypass = overrides.clone();
+        self.insert_chain = fx::build_chain(&rack.slots, self.sample_rate, &overrides);
         self.group_envelopes = envelope::instrument_envelopes(&loaded.instrument.groups);
         if let Some(slot) = rack.slot(0) {
             if let ModuleParams::Filter { cutoff, resonance } = effects::decode(slot) {
@@ -426,6 +447,32 @@ impl Engine {
     /// settings, and loads an impulse response the first time a script asks for it.
     pub fn prepare_block(&mut self) {
         self.sync_filter();
+        // A script toggling an effect bypass has to be picked up while notes are sounding.
+        if let Some(loaded) = self.current.as_ref() {
+            let mut changed = false;
+            let stored = self.insert_bypass.clone();
+            for index in 0..8usize {
+                let value = loaded
+                    .ksp
+                    .engine
+                    .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, 0);
+                if let Some(value) = value {
+                    if stored.get(&index).copied() != Some(value != 0) {
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let current = self.current.clone();
+                self.rebuild_insert_chain(current.as_deref());
+                if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() {
+                    eprintln!(
+                        "debug: rebuilt insert chain, {} units",
+                        self.insert_chain.len()
+                    );
+                }
+            }
+        }
         let Some(loaded) = self.current.clone() else {
             return;
         };
@@ -808,7 +855,7 @@ impl Engine {
     ///
     /// A release-trigger group is the recorded sound of the key being let go: playing it on note-on
     /// puts the release in the attack, which is audible as a click and as a level that does not
-    /// belong to the note. Measured on The Experience, 8Dio's `RTD`/`RTN` samples were firing on
+    /// belong to the note. Measured on one library, its `RTD`/`RTN` samples were firing on
     /// note-on at gain 0.12–0.27 while the note's own samples sat at 0.019.
     fn trigger_phase(
         &mut self,
@@ -839,7 +886,7 @@ impl Engine {
         let mut started = 0usize;
         // A layer boundary is where two velocity-layered recordings abut. Playing only the one
         // whose range contains the velocity makes our output step by the difference between the
-        // recordings — measured at 12 dB on The Experience where Kontakt steps by 1 dB. Fading the
+        // recordings — measured at 12 dB on one library where Kontakt steps by 1 dB. Fading the
         // neighbouring layer in over a few velocity units removes the step without touching the
         // curve inside a layer.
         // Measured against Kontakt over the 127-step sweep: a width of 8 leaves one 2.1 dB step
@@ -927,7 +974,7 @@ impl Engine {
             }
 
             // Kontakt's velocity law is gentle, and the samples already carry most of the dynamics
-            // through their velocity layers. Measured over the full 1..127 sweep on The Experience,
+            // through their velocity layers. Measured over the full 1..127 sweep on one library,
             // its output follows velocity^1.18 while the samples alone slope at 1.03, so the gain
             // it adds is about velocity^0.15. A linear `v/127` made quiet notes 20 dB too quiet;
             // with 0.15 the sweep matches p=1.18 and a 34.1 dB range against Kontakt's 35.3 dB.
@@ -951,9 +998,9 @@ impl Engine {
                 instrument.program.params.volume.max(0.0)
             };
             // The zone private trim is *not* a playback gain, whatever it measures. Applying it
-            // put The Experience 13.9 dB under Kontakt and Studio One 5.8 dB under, and it made
-            // Studio One's round-robin takes alternate by 7 dB (one file carries 0.5 while its
-            // siblings carry 1.0). Dropping it brings both libraries to +1.9 and +0.1 dB.
+            // put one library 13.9 dB under Kontakt and another 5.8 dB under, and it made the
+            // second library's round-robin takes alternate by 7 dB — one file carries 0.5 while
+            // its siblings carry 1.0. Dropping it brings both libraries to +1.9 and +0.1 dB.
             let zone_gain = if mode == "zone" { zone.gain } else { 1.0 };
             let base_gain = (trim
                 * program_volume
@@ -964,6 +1011,10 @@ impl Engine {
                 * layer_weight)
                 .clamp(0.0, 8.0);
             let pan = (zone.pan + group.pan + program.pan).clamp(-1.0, 1.0);
+            // Constant-power pan. A centred voice therefore sits at -3 dB. Normalising it to unity
+            // was tried against a sine library, where it closed a 2.7 dB gap, but the same change
+            // put this player 2.9 dB above Kontakt on a real-sample reference — the two references
+            // disagree by 4 dB, and the real-sample one plays byte-identical files, so it wins.
             let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
             let (gain_left, gain_right) = (angle.cos(), angle.sin());
             let reverse = group.reverse;
@@ -1172,10 +1223,23 @@ impl Engine {
                 send_input_right += bus_right * self.send_level;
             }
         }
+        let trace = std::env::var("OPENKONTAKT_TRACE").is_ok()
+            && self.trace_count < 6
+            && left.abs() > 0.05;
+        if trace {
+            eprintln!("debug: pre-chain {left:.5} {} units", self.insert_chain.len());
+        }
         for fx in &mut self.insert_chain {
             let (l, r) = fx.process(left, right);
             left = l;
             right = r;
+            if trace {
+                eprintln!("debug:   after unit -> {left:.5}");
+            }
+        }
+        if trace {
+            eprintln!("debug: post-chain {left:.5}");
+            self.trace_count += 1;
         }
         if self.send_level > 0.0 && self.conv.is_some() {
             let (send_l, send_r) = self.run_send(send_input_left, send_input_right);

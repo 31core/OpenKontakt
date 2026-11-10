@@ -90,14 +90,14 @@ impl Zone {
     /// How strongly this zone answers a note, allowing a velocity crossfade at layer boundaries.
     ///
     /// Kontakt's output is continuous across a velocity-layer boundary while the two layers'
-    /// recordings are not: on The Experience the step from `C3 24 39` to `C3 40 55` is 12 dB in this
+    /// recordings are not: one library steps from `C3 24 39` to `C3 40 55` is 12 dB in this
     /// reader and 1 dB in Kontakt. `fade` is measured in velocity units; zero restores the plain
     /// range test.
     ///
     /// A complementary pair of ramps (weights summing to one) was tried and made things worse: the
     /// two layers are up to 15 dB apart in level, so blending them linearly digs a dip at the
     /// boundary instead of smoothing a step. This scheme fades the neighbouring layer in at partial
-    /// weight, which measured within 0.2 dB of Kontakt on The Experience (one step of 2.1 dB against
+    /// weight, which measured within 0.2 dB of Kontakt on that library (one step of 2.1 dB against
     /// Kontakt's 2.3).
     pub fn velocity_weight(&self, key: u8, velocity: u8, fade: i16) -> f32 {
         let key = key as i16;
@@ -216,7 +216,7 @@ fn parse_zone(reader: &mut Reader<'_>, index: usize, group_index: usize) -> Resu
     zone.children = children;
     zone.raw_public = public;
 
-    // The zone private section is only partially documented. NFO 0x99 zones begin with
+    // The zone private section is only partially documented. Some 0x99 zones begin with
     // 0xFFFFFFFF, contradicting the "leading mode in 0..=2" note, and the final word is not the
     // KSP source identity there either. Preserve the bytes verbatim instead of inventing fields.
     if zone.private.len() >= 4 {

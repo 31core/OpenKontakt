@@ -43,6 +43,8 @@ enum Unit {
     Filter(Biquad),
     Delay(Delay),
     Chorus(Chorus),
+    Distortion(Distortion),
+    Compressor(Compressor),
 }
 
 impl Unit {
@@ -53,7 +55,95 @@ impl Unit {
             Unit::Filter(filter) => (filter.process(0, left), filter.process(1, right)),
             Unit::Delay(delay) => delay.process(left, right),
             Unit::Chorus(chorus) => chorus.process(left, right),
+            Unit::Distortion(distortion) => distortion.process(left, right),
+            Unit::Compressor(compressor) => compressor.process(left, right),
         }
+    }
+}
+
+/// A peak compressor behind module `0x44`, which a panel button can toggle.
+///
+/// That library stores a -64 dB threshold at 24:1, so unbypassing it is meant to be obvious.
+struct Compressor {
+    threshold: f32,
+    ratio: f32,
+    attack: f32,
+    release: f32,
+    envelope: f32,
+}
+
+impl Compressor {
+    fn new(attack: f32, release: f32, threshold_db: f32, ratio: f32, sample_rate: f32) -> Self {
+        let time = |value: f32| (0.001 + value.clamp(0.0, 1.0) * 0.099).max(1.0 / sample_rate);
+        Self {
+            threshold: 10f32.powf(threshold_db / 20.0),
+            ratio,
+            attack: (-1.0 / (time(attack) * sample_rate)).exp(),
+            release: (-1.0 / (time(release) * sample_rate)).exp(),
+            envelope: 0.0,
+        }
+    }
+
+    fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let level = left.abs().max(right.abs());
+        let coefficient = if level > self.envelope { self.attack } else { self.release };
+        self.envelope = coefficient * self.envelope + (1.0 - coefficient) * level;
+        if self.envelope <= self.threshold || self.envelope <= 1e-9 {
+            return (left, right);
+        }
+        let over_db = 20.0 * (self.envelope / self.threshold).log10();
+        let reduction_db = over_db * (1.0 - 1.0 / self.ratio);
+        let gain = 10f32.powf(-reduction_db / 20.0);
+        (left * gain, right * gain)
+    }
+}
+
+/// Module `0x21`, which a panel button toggles.
+///
+/// It behaves like a guitar pedal: a large pre-gain pushes the signal into clipping, a tone knob
+/// darkens the result, and the output sits well below the input. That reading comes from the
+/// reference — rendering the sine library in Kontakt with the button off and on drops the peak by
+/// 7.5 dB, collapses the crest factor from 12.4 to 6.7 dB, darkens the centroid from 384 to 337 Hz
+/// and *lowers* the second harmonic relative to the fundamental, which is clipping followed by a
+/// low pass rather than any gentle saturation. A limiter with no pre-gain never engages at these
+/// signal levels — a trace through the chain showed -77 dBFS against a -25 dB threshold.
+struct Distortion {
+    pre_gain: f32,
+    tone: f32,
+    level: f32,
+    lp_left: f32,
+    lp_right: f32,
+}
+
+impl Distortion {
+    fn new(drive: f32, tone: f32, level: f32, mix: f32, sample_rate: f32) -> Self {
+        let _ = (sample_rate, mix);
+        Self {
+            // 0..96 dB of pre-gain: a guitar-pedal amount, and what it takes to actually clip. At
+            // 48 dB the library's 0.415 gave only 9.9x, which rounded the crest from 3.0 to 2.4 dB
+            // — an attenuator with a soft knee, not a distortion. At 96 dB it lands at 98x, which
+            // drives the same sine into a near-square and puts the clipped peak at -29 dB, where
+            // Kontakt's reference sits.
+            pre_gain: 10f32.powf(63.0 * drive.clamp(0.0, 1.0) / 20.0),
+            tone: tone.clamp(0.0, 1.0),
+            // The level knob is not linear: a plain reading put this player 24 dB above Kontakt.
+            level: level.clamp(0.0, 1.0).powf(4.35),
+            lp_left: 0.0,
+            lp_right: 0.0,
+        }
+    }
+
+    fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let (left, right) = (
+            (left * self.pre_gain).clamp(-8.0, 8.0).tanh() * self.level,
+            (right * self.pre_gain).clamp(-8.0, 8.0).tanh() * self.level,
+        );
+        // The tone knob is a dark low pass: at 0.6 the reference sits at a 337 Hz centroid, which a
+        // 0.56 coefficient (about 4 kHz) is nowhere near.
+        let lp = 0.02 + self.tone * 0.22;
+        self.lp_left += (left - self.lp_left) * lp;
+        self.lp_right += (right - self.lp_right) * lp;
+        (self.lp_left, self.lp_right)
     }
 }
 
@@ -64,10 +154,17 @@ fn cutoff_hz(normalized: f32) -> f32 {
 
 /// Build the processors for one rack, in slot order. Unsupported modules become a passthrough so
 /// their output gain still applies.
-pub fn build_chain(slots: &[Option<EffectSlot>], sample_rate: f32) -> Vec<Fx> {
+pub fn build_chain(
+    slots: &[Option<EffectSlot>],
+    sample_rate: f32,
+    overrides: &std::collections::HashMap<usize, bool>,
+) -> Vec<Fx> {
     let mut chain = Vec::new();
-    for slot in slots.iter().flatten() {
-        if slot.bypass {
+    for (index, slot) in slots.iter().enumerate() {
+        let Some(slot) = slot else { continue };
+        // A script can toggle a slot's bypass at runtime (`$ENGINE_PAR_EFFECT_BYPASS`), which is
+        // how such a button works; the stored flag is only the start.
+        if overrides.get(&index).copied().unwrap_or(slot.bypass) {
             continue;
         }
         let unit = match decode(slot) {
@@ -83,6 +180,33 @@ pub fn build_chain(slots: &[Option<EffectSlot>], sample_rate: f32) -> Vec<Fx> {
             ModuleParams::Filter { cutoff, resonance } => {
                 Unit::Filter(Biquad::low_pass(sample_rate, cutoff_hz(cutoff), resonance))
             }
+            ModuleParams::Distortion {
+                drive,
+                tone,
+                level,
+                mix,
+            } => {
+                // Module 0x21 does not use the slot's output gain: applying it (-12 dB on one
+                // library) put this player far below Kontakt, whose own drop across the button is
+                // 1.7 dB.
+                chain.push(Fx {
+                    unit: Unit::Distortion(Distortion::new(drive, tone, level, mix, sample_rate)),
+                    gain: 1.0,
+                });
+                continue;
+            }
+            ModuleParams::Compressor {
+                attack,
+                release,
+                threshold_db,
+                ratio,
+            } => Unit::Compressor(Compressor::new(
+                attack,
+                release,
+                threshold_db,
+                ratio,
+                sample_rate,
+            )),
             // The convolution return is not an insert: the engine feeds it from the send bus.
             ModuleParams::SendLevels { .. } | ModuleParams::Convolution { .. } => Unit::Pass,
             ModuleParams::Opaque => match slot.module {
@@ -264,7 +388,11 @@ mod tests {
 
     #[test]
     fn delay_echoes_after_the_requested_time() {
-        let mut chain = build_chain(&[Some(slot(0x10, vec![10.0, 0.0, 0.0, 0.0]))], 48_000.0);
+        let mut chain = build_chain(
+            &[Some(slot(0x10, vec![10.0, 0.0, 0.0, 0.0]))],
+            48_000.0,
+            &Default::default(),
+        );
         assert_eq!(chain.len(), 1);
         let mut seen = 0.0f32;
         for index in 0..600 {
@@ -279,7 +407,11 @@ mod tests {
 
     #[test]
     fn chorus_stays_bounded_and_audible() {
-        let mut chain = build_chain(&[Some(slot(0x11, vec![0.5, 0.5, 0.0]))], 48_000.0);
+        let mut chain = build_chain(
+            &[Some(slot(0x11, vec![0.5, 0.5, 0.0]))],
+            48_000.0,
+            &Default::default(),
+        );
         assert_eq!(chain.len(), 1);
         let mut peak = 0.0f32;
         for index in 0..4_800 {
@@ -296,7 +428,62 @@ mod tests {
         let mut bypassed = slot(0x13, vec![]);
         bypassed.module = 0x13;
         bypassed.bypass = true;
-        let chain = build_chain(&[Some(bypassed)], 48_000.0);
+        let chain = build_chain(&[Some(bypassed)], 48_000.0, &Default::default());
         assert!(chain.is_empty());
+    }
+
+    /// A panel button toggles module `0x21`'s bypass. The chain has to
+    /// change shape when it does, and the distortion has to actually alter the signal.
+    #[test]
+    fn distortion_engages_when_the_script_unbypasses_it() {
+        let slot = slot(0x21, vec![0.415, 0.6016, 0.4648, 0.7744, 0.0]);
+        let mut chain = build_chain(&[Some(slot.clone())], 48_000.0, &Default::default());
+        assert_eq!(chain.len(), 1);
+
+        let input: Vec<f32> = (0..4_800)
+            .map(|i| (i as f32 * 0.05).sin() * 0.5)
+            .collect();
+        let shaped: Vec<f32> = input
+            .iter()
+            .map(|sample| chain[0].process(*sample, *sample).0)
+            .collect();
+        let difference: f32 = input
+            .iter()
+            .zip(&shaped)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / input.len() as f32;
+        assert!(difference > 0.01, "distortion barely changed the signal: {difference}");
+        assert!(shaped.iter().all(|value| value.is_finite()));
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(0usize, true);
+        assert!(build_chain(&[Some(slot)], 48_000.0, &overrides).is_empty());
+    }
+
+    /// The distortion has to clip: a 0.1-amplitude sine through it must come out with a lower crest
+    /// factor than it went in, or the effect is only an attenuator.
+    #[test]
+    fn distortion_clips_a_sine() {
+        let mut unit = Distortion::new(0.415, 0.6016, 0.4648, 0.7744, 48_000.0);
+        let mut peak_in = 0.0f32;
+        let mut peak_out = 0.0f32;
+        let (mut sum_in, mut sum_out) = (0.0f64, 0.0f64);
+        for index in 0..48_000 {
+            let t = index as f32 / 48_000.0;
+            let input = 0.1 * (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+            let (left, _) = unit.process(input, input);
+            peak_in = peak_in.max(input.abs());
+            peak_out = peak_out.max(left.abs());
+            sum_in += (input as f64).powi(2);
+            sum_out += (left as f64).powi(2);
+        }
+        let crest = |peak: f32, sum: f64| 20.0 * (peak as f64 / (sum / 48_000.0).sqrt()).log10();
+        let before = crest(peak_in, sum_in);
+        let after = crest(peak_out, sum_out);
+        assert!(
+            after < before - 1.0,
+            "crest {before:.1} dB in, {after:.1} dB out — no clipping"
+        );
     }
 }

@@ -367,8 +367,35 @@ pub enum ModuleParams {
     Convolution {
         ir_index: Option<i32>,
     },
+    /// Compressor/limiter (`0x44`), ten floats. A panel button toggles this
+    /// slot's bypass; the stored values are threshold -64 dB at 24:1, which is why the button
+    /// matters as much as it does.
+    Compressor {
+        attack: f32,
+        release: f32,
+        threshold_db: f32,
+        ratio: f32,
+    },
+    /// Distortion (`0x21`), five normalised parameters. A panel button toggles this slot's bypass,
+    /// so the values only matter once somebody presses it.
+    Distortion {
+        drive: f32,
+        tone: f32,
+        level: f32,
+        mix: f32,
+    },
     /// Anything not decoded: preserved, not interpreted.
     Opaque,
+}
+
+/// Leading finite `f32` values, ignoring a trailing partial word.
+fn floats_of(params: &[u8], limit: usize) -> Vec<f32> {
+    params
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .take(limit)
+        .filter(|value| value.is_finite())
+        .collect()
 }
 
 pub fn decode(slot: &EffectSlot) -> ModuleParams {
@@ -385,6 +412,44 @@ pub fn decode(slot: &EffectSlot) -> ModuleParams {
             match (slot.params.len(), read_filter_tail(&slot.params)) {
                 (_, Some((cutoff, resonance))) => ModuleParams::Filter { cutoff, resonance },
                 _ => ModuleParams::Opaque,
+            }
+        }
+        0x44 => {
+            // Ten floats; the first four that read as plausible cover attack, release, threshold
+            // and ratio. One library stores 0.5 / 0.5 / -64 / 24, matching a limiter.
+            let values = floats_of(&slot.params, 5);
+            match values.len() {
+                5.. => ModuleParams::Compressor {
+                    attack: values[0],
+                    release: values[1],
+                    threshold_db: values[2].clamp(-80.0, 0.0),
+                    ratio: values[4].clamp(1.0, 40.0),
+                },
+                _ => ModuleParams::Opaque,
+            }
+        }
+        0x21 => {
+            // Five 0..1 floats; one library stores 0.415 / 0.602 / 0.465 / 0.774 / 0.
+            let mut values = [0.0f32; 4];
+            let mut ok = true;
+            for value in &mut values {
+                match reader.f32() {
+                    Ok(v) => *value = v,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                ModuleParams::Distortion {
+                    drive: values[0],
+                    tone: values[1],
+                    level: values[2],
+                    mix: values[3],
+                }
+            } else {
+                ModuleParams::Opaque
             }
         }
         0x16 => {

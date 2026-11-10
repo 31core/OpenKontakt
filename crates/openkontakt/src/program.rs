@@ -19,7 +19,7 @@ pub struct ProgramParams {
     pub default_keyswitch: i16,
     /// Preload buffer size in **bytes**, per sample — Kontakt's "DFD preload buffer size".
     ///
-    /// Every observed library stores 61440 (60 KiB) except 8Dio's 1928 Piano, which stores 245760
+    /// Every observed library stores 61440 (60 KiB) except one piano library, which stores 245760
     /// (240 KiB). Reading this as a frame count over-allocates by the frame size (6× for 24-bit
     /// stereo).
     pub dfd_preload: i32,
