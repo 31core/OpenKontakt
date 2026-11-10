@@ -257,8 +257,57 @@ pub(crate) fn build(
         *r = sr;
     }
     let (left, right) = resample_ir(&left, &right, sample.sample_rate as f32, target_rate);
+    let (left, right) = truncate_ir(left, right, target_rate);
     let (left, right) = normalise_ir(left, right);
     Some(openkontakt::dsp::Convolver::new(&left, &right, block_size))
+}
+
+/// Longest impulse response the convolver keeps, in seconds.
+const MAX_IR_SECONDS: f32 = 12.0;
+
+/// Level below the response's own peak at which the tail is cut, in dB.
+const IR_TAIL_FLOOR_DB: f32 = -72.0;
+
+/// Cut an impulse response's inaudible tail.
+///
+/// Partitioned convolution costs one partition per block of response, so a long response is paid
+/// for on every block. One library ships a 100-second hall: 8600 partitions at a 512-frame block,
+/// which ran at a third of real time and starved the audio callback. Its tail is not worth that —
+/// 99.7% of its energy is in the first five seconds, it is 60 dB down by 26 s, and everything past
+/// that is below any audible contribution. Responses shorter than the cap and with no dead tail
+/// come back untouched.
+fn truncate_ir(mut left: Vec<f32>, mut right: Vec<f32>, rate: f32) -> (Vec<f32>, Vec<f32>) {
+    if left.is_empty() || rate <= 0.0 {
+        return (left, right);
+    }
+    let peak = left
+        .iter()
+        .chain(right.iter())
+        .fold(0.0f32, |highest, value| highest.max(value.abs()));
+    if peak <= 0.0 {
+        return (left, right);
+    }
+    let floor = peak * 10f32.powf(IR_TAIL_FLOOR_DB / 20.0);
+    let window = ((rate * 0.01) as usize).max(1);
+    let cap = ((rate * MAX_IR_SECONDS) as usize).min(left.len());
+    let mut last = 0usize;
+    let mut index = 0usize;
+    while index < cap {
+        let end = (index + window).min(cap);
+        let level = (index..end).fold(0.0f32, |highest, at| {
+            highest.max(left[at].abs()).max(right[at].abs())
+        });
+        if level > floor {
+            last = end;
+        }
+        index += window;
+    }
+    let limit = last.max(window).min(cap);
+    if limit < left.len() {
+        left.truncate(limit);
+        right.truncate(limit);
+    }
+    (left, right)
 }
 
 /// Scale an impulse response to unit energy, so the convolution preserves the level of whatever is
@@ -425,4 +474,47 @@ mod tests {
         let mask = result.dispatch.allowed_groups.expect("routing");
         assert_eq!(mask, vec![false, true, false]);
     }
+
+    /// A response whose tail is far below the floor gets cut; one that stays alive does not.
+    #[test]
+    fn a_dead_tail_is_truncated() {
+        let rate = 48_000.0f32;
+        let mut left = vec![0.0f32; (rate * 30.0) as usize];
+        // Half a second of signal, then 29.5 seconds of digital silence.
+        for (index, value) in left.iter_mut().enumerate().take((rate * 0.5) as usize) {
+            *value = ((index as f32) * 0.01).sin() * 0.5;
+        }
+        let right = left.clone();
+        let (left, right) = truncate_ir(left, right, rate);
+        assert!(
+            left.len() < (rate * 1.0) as usize,
+            "tail kept: {} frames",
+            left.len()
+        );
+        assert_eq!(left.len(), right.len());
+    }
+
+    #[test]
+    fn a_live_response_is_kept() {
+        let rate = 48_000.0f32;
+        let left: Vec<f32> = (0..(rate * 3.0) as usize)
+            .map(|index| ((index as f32) * 0.01).sin() * 0.5)
+            .collect();
+        let right = left.clone();
+        let (left, right) = truncate_ir(left, right, rate);
+        assert_eq!(left.len(), (rate * 3.0) as usize);
+        assert_eq!(left.len(), right.len());
+    }
+
+    /// The cap matters on its own: a response that never decays below the floor is still cut.
+    #[test]
+    fn the_cap_holds_for_a_response_that_never_decays() {
+        let rate = 48_000.0f32;
+        let frames = (rate * 30.0) as usize;
+        let left = vec![0.1f32; frames];
+        let right = left.clone();
+        let (left, _) = truncate_ir(left, right, rate);
+        assert!(left.len() <= (rate * MAX_IR_SECONDS) as usize);
+    }
 }
+

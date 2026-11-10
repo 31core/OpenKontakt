@@ -184,6 +184,9 @@ pub struct UiControl {
     pub bar_color: Option<i64>,
     /// Parts hidden with `hide_part`: 1 = background, 2 = cursor, 4 = value, 8 = title,
     /// 16 = whole control.
+    /// `$CONTROL_PAR_HIDE` / `hide_part` bitmask. Bit 16 the whole control, bit 1 just its
+    /// background. Panels page themselves with it: every page's controls are hidden except the
+    /// current page's, so a reader that ignores it stacks all of them at once.
     pub hidden_parts: u32,
 }
 
@@ -1246,6 +1249,9 @@ impl<'a> Interp<'a> {
                             control.px = true;
                         }
                         "CONTROL_PAR_MOUSE_BEHAVIOUR" => control.mouse_behaviour = value as i32,
+                        // Panels page themselves by hiding whole controls, so this has to feed
+                        // the same state `hide_part` writes; ignoring it draws every page at once.
+                        "CONTROL_PAR_HIDE" => control.hidden_parts = value as u32,
                         "CONTROL_PAR_WIDTH" => control.pixel_width = Some(value as i32),
                         "CONTROL_PAR_HEIGHT" => control.pixel_height = Some(value as i32),
                         "CONTROL_PAR_BAR_COLOR" => control.bar_color = Some(value),
@@ -1561,6 +1567,9 @@ pub const INST_ID_BASE: i64 = 1_000_000;
 pub const INST_WALLPAPER_ID: i64 = INST_ID_BASE;
 pub const INST_ICON_ID: i64 = INST_ID_BASE + 1;
 
+/// Bit in `$CONTROL_PAR_HIDE` that removes a control from the panel entirely.
+pub const HIDE_WHOLE_CONTROL: i64 = 16;
+
 /// KSP constants that behave like integers. `$ENGINE_PAR_*` and `$CONTROL_PAR_*` are handled
 /// symbolically at their call sites, so only the arithmetic constants need values here.
 fn symbol(name: &str) -> Option<Value> {
@@ -1590,6 +1599,14 @@ fn symbol(name: &str) -> Option<Value> {
         "INST_KEYBOARD_ID" => INST_ID_BASE + 4,
         "INST_OUTPUT_ID" => INST_ID_BASE + 5,
         "INST_MAIN_VIEW_ID" => INST_ID_BASE + 6,
+        // `$CONTROL_PAR_HIDE` bits. Only the whole-control bit changes layout; the individual
+        // parts (background, title, value, modulation light) are cosmetic.
+        "HIDE_PART_NOTHING" => 0,
+        "HIDE_PART_BG" => 1,
+        "HIDE_PART_TITLE" => 2,
+        "HIDE_PART_VALUE" => 4,
+        "HIDE_PART_MOD_LIGHT" => 8,
+        "HIDE_WHOLE_CONTROL" => HIDE_WHOLE_CONTROL,
         _ => return None,
     }))
 }
@@ -2566,5 +2583,23 @@ mod tests {
         assert_eq!(controls.len(), 1);
         assert_eq!(controls[0].value, 630_000);
         assert!(runtime.set_control_normalized(0, "mic", 0.5));
+    }
+
+    /// Panels page themselves by hiding whole controls, so `$CONTROL_PAR_HIDE` has to land in the
+    /// same state `hide_part` writes. Without it every page of a paged panel draws at once.
+    #[test]
+    fn control_par_hide_pages_the_panel() {
+        let text = r#"
+        on init
+          declare ui_slider $page_a (0, 100)
+          declare ui_slider $page_b (0, 100)
+          set_control_par(get_ui_id($page_b), $CONTROL_PAR_HIDE, $HIDE_WHOLE_CONTROL)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        let controls = runtime.controls(0);
+        assert_eq!(controls[0].hidden_parts & HIDE_WHOLE_CONTROL as u32, 0);
+        assert_ne!(controls[1].hidden_parts & HIDE_WHOLE_CONTROL as u32, 0);
     }
 }

@@ -1432,6 +1432,10 @@ impl OpenKontaktEditor {
             // rows and never reaches `ui_height_px`. Falling back to 1 px there clipped the
             // wallpaper to a two-pixel strip, which reads as a black panel. When nothing is
             // declared the picture itself is the panel, so its own aspect is the honest answer.
+            // The height the file declares is the one the artwork is measured against. A script
+            // asking for a taller panel at runtime does not move the artwork with it: one panel
+            // declares 750 px and ships an 818 px wallpaper, and the 68 px difference is exactly
+            // the offset the bottom anchor produces once the panel stops being clamped to the view.
             let declared_height =
                 loaded.map_or(0.0, |loaded| loaded.instrument.ksp_panel.ui_height_px);
             let image_size = texture.size_vec2();
@@ -1447,7 +1451,7 @@ impl OpenKontaktEditor {
             let scale = art.width() / ui_width;
             let panel = Rect::from_min_size(
                 art.min,
-                Vec2::new(art.width(), (ui_height * scale).min(art.height())),
+                Vec2::new(art.width(), ui_height * scale),
             );
             let image_height = image_size.y * scale;
             // A wallpaper a little taller than the panel is the panel's own artwork with its
@@ -1459,23 +1463,15 @@ impl OpenKontaktEditor {
             // view, so the view starts 66 px into the page. A wallpaper that is merely a little taller than the
             // panel is the panel's own artwork with a few pixels of bleed and stays pinned to the
             // bottom, which is what keeps that library's labels under their controls.
-            // `OPENKONTAKT_WALLPAPER_SHIFT` overrides the derived offset, so a value can be
-            // compared against the reference without rebuilding. Remove once the rule is settled.
-            let shift = match std::env::var("OPENKONTAKT_WALLPAPER_SHIFT")
-                .ok()
-                .and_then(|value| value.parse::<f32>().ok())
+            let shift = match self
+                .background_page
+                .filter(|_| image_height > panel.height() * 1.5)
             {
-                Some(override_px) => override_px * scale,
-                None => match self
-                    .background_page
-                    .filter(|_| image_height > panel.height() * 1.5)
-                {
-                    // The page is centred in the panel: one library's page is 668 px for a 536 px
-                    // view, which puts the visible band at 66..602 — the reference's alignment within a
-                    // couple of pixels.
-                    Some(page) => (((page as f32 - ui_height) / 2.0).max(0.0)) * scale,
-                    None => 0.0,
-                },
+                // The page is centred in the panel: one library's page is 668 px for a 536 px
+                // view, which puts the visible band at 66..602 — the reference's alignment within a
+                // couple of pixels.
+                Some(page) => (((page as f32 - ui_height) / 2.0).max(0.0)) * scale,
+                None => 0.0,
             };
             self.wallpaper_shift_native = shift / scale;
             let page_sheet = shift > 0.0;
@@ -1731,6 +1727,9 @@ impl OpenKontaktEditor {
                 .collect(),
         }
         .into_iter()
+        // A control the script hid is not part of the current page. Without this every page of a
+        // paged panel draws at once, stacked on top of each other.
+        .filter(|control| control.hidden_parts & 16 == 0)
         .map(|control| KspControl {
             name: format!("${}", control.name),
             kind: match control.kind {
