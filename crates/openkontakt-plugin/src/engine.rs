@@ -201,6 +201,9 @@ pub struct Engine {
     age_counter: u64,
     /// `$EVENT_ID` and velocity of the note-on that started each key, for `on release`.
     event_ids: [i64; 128],
+    /// The key each held note was rewritten to by `change_note`, so the release callback and the
+    /// zone lookup agree with what KONTAKT would see.
+    changed_notes: [Option<u8>; 128],
     event_velocity: [u8; 128],
     next_event_id: i64,
     current: Option<Arc<LoadedInstrument>>,
@@ -251,6 +254,7 @@ impl Default for Engine {
             voices: (0..MAX_VOICES).map(|_| Voice::default()).collect(),
             age_counter: 0,
             event_ids: [0; 128],
+            changed_notes: [None; 128],
             event_velocity: [0; 128],
             next_event_id: 1,
             current: None,
@@ -586,6 +590,16 @@ impl Engine {
         }
     }
 
+    /// The key a script moved this event to with `change_note`, if it did.
+    fn changed_note(actions: &[ScriptAction], event_id: i64) -> Option<u8> {
+        actions.iter().find_map(|action| match action {
+            ScriptAction::ChangeNote { id, note } if *id == event_id => {
+                Some((*note).clamp(0, 127) as u8)
+            }
+            _ => None,
+        })
+    }
+
     /// Apply any script results that are ready. Called once per sample from the audio callback.
     pub fn poll_script(&mut self) {
         let mut results = Vec::new();
@@ -596,10 +610,12 @@ impl Engine {
         }
         for result in results {
             match result.command {
-                ScriptCommand::NoteOn { key, velocity, .. } => {
+                ScriptCommand::NoteOn { key, velocity, id } => {
                     let allowed = result.dispatch.allowed_groups.clone();
+                    let note = Self::changed_note(&result.dispatch.actions, id);
+                    self.changed_notes[key as usize & 127] = note;
                     if !result.dispatch.ignore_event {
-                        self.trigger(key, velocity, allowed.as_deref());
+                        self.trigger_at(note.unwrap_or(key), key, velocity, allowed.as_deref());
                     }
                     self.execute_actions(&result.dispatch.actions, allowed.as_deref());
                 }
@@ -709,11 +725,13 @@ impl Engine {
             },
         );
         let allowed = dispatch.allowed_groups.clone();
+        let note = Self::changed_note(&dispatch.actions, id);
+        self.changed_notes[key as usize & 127] = note;
         if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() {
             eprintln!("debug: mask for key {key} vel {velocity_127} = {allowed:?}");
         }
         if !dispatch.ignore_event {
-            self.trigger(key, velocity_127, allowed.as_deref());
+            self.trigger_at(note.unwrap_or(key), key, velocity_127, allowed.as_deref());
         }
         self.execute_actions(&dispatch.actions, allowed.as_deref());
     }
@@ -724,15 +742,17 @@ impl Engine {
             return;
         };
         let id = self.event_ids[key as usize & 127];
+        let played = self.changed_notes[key as usize & 127].unwrap_or(key);
         let dispatch = loaded.ksp.dispatch(
             "release",
             EventContext {
-                note: key as i64,
+                note: played as i64,
                 velocity: self.event_velocity[key as usize & 127] as i64,
                 id,
                 status: 0,
             },
         );
+        self.changed_notes[key as usize & 127] = None;
         for voice in &mut self.voices {
             if voice.active && voice.note == key && voice.env.stage != EnvelopeStage::Release {
                 voice.env.release();
@@ -790,6 +810,9 @@ impl Engine {
                         }
                     }
                 }
+                // Handled where the event is triggered: the rewrite has to happen before the
+                // zones are matched, not after.
+                ScriptAction::ChangeNote { .. } => {}
             }
         }
     }
@@ -851,6 +874,12 @@ impl Engine {
         self.trigger_phase(key, velocity_127, allowed, TriggerPhase::NoteOn);
     }
 
+    /// Start a note whose key a script rewrote: `note` picks the zones and the pitch, `event_key`
+    /// stays the key that was played so its note-off still finds the voice.
+    fn trigger_at(&mut self, note: u8, event_key: u8, velocity_127: u8, allowed: Option<&[bool]>) {
+        self.trigger_phase_at(note, event_key, velocity_127, allowed, TriggerPhase::NoteOn);
+    }
+
     /// Start voices for a key, restricted to the groups that belong to this phase.
     ///
     /// A release-trigger group is the recorded sound of the key being let go: playing it on note-on
@@ -860,6 +889,17 @@ impl Engine {
     fn trigger_phase(
         &mut self,
         key: u8,
+        velocity_127: u8,
+        allowed: Option<&[bool]>,
+        phase: TriggerPhase,
+    ) {
+        self.trigger_phase_at(key, key, velocity_127, allowed, phase);
+    }
+
+    fn trigger_phase_at(
+        &mut self,
+        key: u8,
+        event_key: u8,
         velocity_127: u8,
         allowed: Option<&[bool]>,
         phase: TriggerPhase,
@@ -1018,13 +1058,13 @@ impl Engine {
             let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
             let (gain_left, gain_right) = (angle.cos(), angle.sin());
             let reverse = group.reverse;
-            let event_id = self.event_ids[key as usize & 127];
+            let event_id = self.event_ids[event_key as usize & 127];
             let envelope = self.voice_envelope(zone.group_index);
 
             started += 1;
             self.start_voice(Voice {
                 active: true,
-                note: key,
+                note: event_key,
                 sample: SampleCursor::new(sample),
                 position: if reverse {
                     (end_frame - 1.0).max(start_frame)

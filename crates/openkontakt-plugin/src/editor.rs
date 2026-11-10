@@ -2238,22 +2238,12 @@ impl OpenKontaktEditor {
         let Some(resource) = self.pictures.get(&name) else {
             return false;
         };
-        let last = resource.frames.saturating_sub(1).max(1);
-        let index = ((value.clamp(0.0, 1.0) * last as f32).round() as usize).min(last);
-        let step = 1.0 / resource.frames.max(1) as f32;
-        let uv = if resource.horizontal {
-            Rect::from_min_max(
-                Pos2::new(index as f32 * step, 0.0),
-                Pos2::new((index + 1) as f32 * step, 1.0),
-            )
-        } else {
-            Rect::from_min_max(
-                Pos2::new(0.0, index as f32 * step),
-                Pos2::new(1.0, (index + 1) as f32 * step),
-            )
-        };
-        p.ui.painter()
-            .image(resource.texture.id(), cell, uv, Color32::WHITE);
+        p.ui.painter().image(
+            resource.texture.id(),
+            cell,
+            picture_uv(resource, value),
+            Color32::WHITE,
+        );
         true
     }
 
@@ -3687,6 +3677,32 @@ fn panel_rect(
     )
 }
 
+/// Which frame of a sprite sheet a control's value selects.
+///
+/// A single-frame picture is the whole texture, whatever the value: a button whose stored value is
+/// 1 used to ask for frame 1 of a one-frame sheet, i.e. the band *past* the right edge, and drew
+/// nothing at all. That is why every "on" button in a panel went missing while its "off"
+/// neighbours stayed.
+fn picture_uv(resource: &PictureResource, value: f32) -> Rect {
+    if resource.frames <= 1 {
+        return Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+    }
+    let last = resource.frames - 1;
+    let index = ((value.clamp(0.0, 1.0) * last as f32).round() as usize).min(last);
+    let step = 1.0 / resource.frames as f32;
+    if resource.horizontal {
+        Rect::from_min_max(
+            Pos2::new(index as f32 * step, 0.0),
+            Pos2::new((index + 1) as f32 * step, 1.0),
+        )
+    } else {
+        Rect::from_min_max(
+            Pos2::new(0.0, index as f32 * step),
+            Pos2::new(1.0, (index + 1) as f32 * step),
+        )
+    }
+}
+
 /// Native frame size of a control's picture resource, when the library ships one.
 fn picture_frame_of(
     pictures: &HashMap<String, PictureResource>,
@@ -4141,6 +4157,50 @@ mod tests {
         assert!(editor.pictures_root.is_none());
         assert!(editor.background_source.is_none());
         assert!(editor.header_icon_source.is_none());
+    }
+
+    /// A one-frame sprite is the whole texture at every value. Asking for frame 1 of a one-frame
+    /// sheet used to sample past the right edge and draw nothing, which removed every button whose
+    /// stored value was 1 from a library panel.
+    #[test]
+    fn a_single_frame_picture_is_drawn_whole() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "t",
+            egui::ColorImage::new([4, 4], vec![Color32::WHITE; 16]),
+            TextureOptions::LINEAR,
+        );
+        let resource = PictureResource {
+            texture,
+            frames: 1,
+            horizontal: true,
+            frame: Vec2::new(150.0, 48.0),
+            resizable: false,
+        };
+        let full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        assert_eq!(picture_uv(&resource, 0.0), full);
+        assert_eq!(picture_uv(&resource, 1.0), full);
+    }
+
+    #[test]
+    fn a_sprite_sheet_picks_a_frame_by_value() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "t",
+            egui::ColorImage::new([4, 4], vec![Color32::WHITE; 16]),
+            TextureOptions::LINEAR,
+        );
+        let resource = PictureResource {
+            texture,
+            frames: 2,
+            horizontal: true,
+            frame: Vec2::new(75.0, 48.0),
+            resizable: false,
+        };
+        assert_eq!(picture_uv(&resource, 0.0).min.x, 0.0);
+        assert_eq!(picture_uv(&resource, 0.0).max.x, 0.5);
+        assert_eq!(picture_uv(&resource, 1.0).min.x, 0.5);
+        assert_eq!(picture_uv(&resource, 1.0).max.x, 1.0);
     }
 
     /// The black-key shading has to land on the values sampled from KONTAKT's own keybed, or

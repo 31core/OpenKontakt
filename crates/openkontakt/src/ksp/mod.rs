@@ -308,6 +308,8 @@ pub trait Host {
     fn disallow_group(&mut self, _group: i64) {}
     fn play_note(&mut self, _note: i64, _velocity: i64, _offset: i64, _release: i64) {}
     fn note_off_event(&mut self, _id: i64) {}
+    /// `change_note`: retarget one event to another key.
+    fn change_note(&mut self, _id: i64, _note: i64) {}
     fn ignore_event(&mut self) {}
     fn group_release_trigger(&mut self, _group: i64) -> bool {
         false
@@ -337,6 +339,13 @@ pub enum ScriptAction {
     },
     NoteOff {
         id: i64,
+    },
+    /// `change_note`: the event plays, and keeps playing, at another key. KONTAKT re-points the
+    /// event itself, so the *release* callback sees the new note too — which is how a script
+    /// recognises "the key it played as 16" when the key comes up.
+    ChangeNote {
+        id: i64,
+        note: i64,
     },
 }
 
@@ -805,6 +814,10 @@ impl Host for EngineHost {
 
     fn note_off_event(&mut self, id: i64) {
         self.actions.push(ScriptAction::NoteOff { id });
+    }
+
+    fn change_note(&mut self, id: i64, note: i64) {
+        self.actions.push(ScriptAction::ChangeNote { id, note });
     }
 
     fn ignore_event(&mut self) {
@@ -1347,6 +1360,12 @@ impl<'a> Interp<'a> {
             "note_off" => {
                 let id = self.eval_arg(args, 0)?;
                 self.host.note_off_event(id);
+                Ok(Value::Int(0))
+            }
+            "change_note" => {
+                let id = self.eval_arg(args, 0)?;
+                let note = self.eval_arg(args, 1)?;
+                self.host.change_note(id, note);
                 Ok(Value::Int(0))
             }
             "ignore_event" => {

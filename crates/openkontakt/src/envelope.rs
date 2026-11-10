@@ -70,6 +70,7 @@ pub fn ms_to_normalized(ms: f32) -> f32 {
 
 const CHUNK_AHDSR: u16 = 0x3F;
 const CHUNK_INTERNAL_MODS: u16 = 0x3B;
+const CHUNK_MODULATOR: u16 = 0x0D;
 
 /// Parse a `0x3F` body. The object is flat: `u8 flag`, `u16 version`, then six floats.
 pub fn parse_ahdsr(body: &[u8]) -> Option<Ahdsr> {
@@ -106,17 +107,112 @@ pub fn parse_ahdsr(body: &[u8]) -> Option<Ahdsr> {
     Some(envelope)
 }
 
-/// The group's amplitude envelope: the first AHDSR anywhere inside its `0x3B` modulator array.
+/// The name a modulator carries when its envelope addresses `volume`.
+const VOLUME_ENVELOPE_TAG: &[u8] = b"ENV_AHDSR_VOLUME";
+
+/// The group's amplitude envelope: the AHDSR of the modulator that targets `volume`.
 ///
-/// The modulator's target list decides which envelope addresses `volume`; decoding that two-pass
-/// target/shaper grammar is not needed for the common case, because a group has exactly one
-/// amplitude envelope and it is the first AHDSR in the array.
+/// A group can carry several envelopes and their order in the `0x3B` array is whatever the author
+/// added first. A guitar patch that models pick dynamics with a filter envelope puts the *filter*
+/// one there, so "the first AHDSR" is the wrong envelope: using it gives the instrument a 3.6 s
+/// attack and zero sustain, because those are the cutoff envelope's numbers. Select by target.
 pub fn group_amp_envelope(group: &Group) -> Option<Ahdsr> {
     let array = group
         .children
         .iter()
         .find(|child| child.id == CHUNK_INTERNAL_MODS)?;
-    find_ahdsr(&array.body, 0)
+    amp_envelope_from_array(&array.body)
+}
+
+/// The same choice, made on the `0x3B` array body alone.
+fn amp_envelope_from_array(body: &[u8]) -> Option<Ahdsr> {
+    let mut first = None;
+    for (id, payload) in presence_chunks(body, 3) {
+        if id != CHUNK_MODULATOR {
+            continue;
+        }
+        let Some(envelope) = scan_ahdsr(payload, 0) else {
+            continue;
+        };
+        if contains(payload, VOLUME_ENVELOPE_TAG) {
+            return Some(envelope);
+        }
+        first.get_or_insert(envelope);
+    }
+    first
+        .or_else(|| find_ahdsr(body, 0))
+        .or_else(|| scan_ahdsr(body, 0))
+}
+
+/// Split a presence-prefixed chunk list: `[u8 present][u16 id][u32 length][payload]`, repeated.
+fn presence_chunks(body: &[u8], mut at: usize) -> Vec<(u16, &[u8])> {
+    let mut out = Vec::new();
+    while at + 7 <= body.len() {
+        if body[at] != 1 {
+            break;
+        }
+        let id = u16::from_le_bytes([body[at + 1], body[at + 2]]);
+        let length =
+            u32::from_le_bytes([body[at + 3], body[at + 4], body[at + 5], body[at + 6]]) as usize;
+        let start = at + 7;
+        if start + length > body.len() {
+            break;
+        }
+        out.push((id, &body[start..start + length]));
+        at = start + length;
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Search nested chunk data for an AHDSR, without knowing how many layers wrap it or whether the
+/// wrappers carry a presence byte.
+///
+/// The envelope sits two or three levels down (`0x0D` → `0x07` → `0x3F`), and the two writers in
+/// this corpus disagree on framing: a chunk is either `[u8 present][u16 id][u32 length]` or
+/// `[u32 size][u16 id][u32 length]`. `parse_ahdsr` is the filter — a wrong offset almost never
+/// yields a `0x10`/`0x11` version followed by plausible times.
+fn scan_ahdsr(bytes: &[u8], depth: usize) -> Option<Ahdsr> {
+    if depth > 6 {
+        return None;
+    }
+    if let Some(envelope) = parse_ahdsr(bytes) {
+        return Some(envelope);
+    }
+    for at in 0..bytes.len() {
+        for (id_offset, length_offset, payload_offset) in
+            [(0usize, 2usize, 6usize), (1usize, 3usize, 7usize)]
+        {
+            let Some(header) = bytes.get(at..at + length_offset + 4) else {
+                continue;
+            };
+            let id = u16::from_le_bytes([header[id_offset], header[id_offset + 1]]);
+            let length = u32::from_le_bytes([
+                header[length_offset],
+                header[length_offset + 1],
+                header[length_offset + 2],
+                header[length_offset + 3],
+            ]) as usize;
+            let Some(payload) = bytes.get(at + payload_offset..at + payload_offset + length) else {
+                continue;
+            };
+            if id == CHUNK_AHDSR {
+                if let Some(envelope) = parse_ahdsr(payload) {
+                    return Some(envelope);
+                }
+            } else if length >= 3 {
+                if let Some(envelope) = scan_ahdsr(payload, depth + 1) {
+                    return Some(envelope);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Depth-first search for a `0x3F` chunk inside nested structured objects.
@@ -220,6 +316,64 @@ mod tests {
         assert_eq!(envelope.hold_ms, 10.0);
         assert_eq!(envelope.release_ms, 900.0);
         assert_eq!(envelope.sustain, 0.5);
+    }
+
+    /// A modulator payload as the guitar patches write it: a `0x80` header naming the target,
+    /// then the envelope wrapped in a `0x07`.
+    fn modulator(name: &str, attack: f32, release: f32, sustain: f32) -> Vec<u8> {
+        fn chunk(id: u16, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![1u8];
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut body = chunk(0x80, format!("ENV_AHDSR_{name}").as_bytes());
+        body.extend_from_slice(&chunk(
+            0x07,
+            &chunk(0x3F, &ahdsr_body(attack, 0.0, 0.0, release, sustain)),
+        ));
+        body
+    }
+
+    fn array_with_envelopes(modulators: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut array = vec![0u8, 0x12, 0x00];
+        for modulator in modulators {
+            array.extend_from_slice(&chunk_with_presence(0x0D, &modulator));
+        }
+        array
+    }
+
+    fn chunk_with_presence(id: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![1u8];
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The amplifier envelope is the one whose modulator targets `volume`, and it is not
+    /// necessarily the first: these guitar patches model pick dynamics with a filter envelope and
+    /// store the filter first. Taking the first AHDSR gave the instrument a 3.6 s attack and zero
+    /// sustain, which is the cutoff envelope's shape, not the amplifier's.
+    #[test]
+    fn picks_the_volume_envelope_out_of_several() {
+        let array = array_with_envelopes(vec![
+            modulator("CUTOFF", 3596.6, 0.0, 0.0),
+            modulator("VOLUME", 0.0, 2411.0, 1.0),
+        ]);
+        let envelope = amp_envelope_from_array(&array).expect("envelope");
+        assert_eq!(envelope.attack_ms, 0.0);
+        assert_eq!(envelope.release_ms, 2411.0);
+        assert_eq!(envelope.sustain, 1.0);
+    }
+
+    #[test]
+    fn falls_back_to_the_only_envelope() {
+        let array = array_with_envelopes(vec![modulator("CUSTOM", 12.0, 300.0, 0.8)]);
+        let envelope = amp_envelope_from_array(&array).expect("envelope");
+        assert_eq!(envelope.attack_ms, 12.0);
+        assert_eq!(envelope.release_ms, 300.0);
     }
 
     #[test]

@@ -222,6 +222,97 @@ fn main() {
                     );
                 }
             }
+            if std::env::args().any(|arg| arg == "--panel") {
+                // The *executed* panel: scripts move, relabel and repaint controls from their
+                // callbacks, so this compiles the scripts first.
+                let root = instrument
+                    .source_path
+                    .parent()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                let texts: Vec<Option<String>> = instrument
+                    .scripts
+                    .iter()
+                    .map(|slot| slot.text.clone())
+                    .collect();
+                let groups: Vec<openkontakt::ksp::GroupInfo> = instrument
+                    .groups
+                    .iter()
+                    .map(|group| openkontakt::ksp::GroupInfo {
+                        release_trigger: group.release_trigger,
+                        envelope: openkontakt::envelope::group_amp_envelope(group),
+                    })
+                    .collect();
+                let runtime = openkontakt::KspRuntime::compile_with_groups(&texts, &root, groups);
+                runtime.initialize();
+                // `--press NAME` runs that control's `on ui_control`, which is what a click does.
+                if let Some(position) = std::env::args().position(|arg| arg == "--press") {
+                    if let Some(name) = std::env::args().nth(position + 1) {
+                        let mut pressed = false;
+                        for slot in 0..runtime.slot_count() {
+                            if runtime.set_control_normalized(slot, &name, 1.0) {
+                                pressed = true;
+                            }
+                        }
+                        println!("  pressed {name}: {pressed}");
+                    }
+                }
+                for slot in 0..runtime.slot_count() {
+                    for control in runtime.controls(slot) {
+                        println!(
+                            "  slot {} {:>10} {:>9} {:>5},{:<5} {:>4}x{:<4} value={:<6} hidden={:<3} picture={:?} text={:?}",
+                            slot,
+                            control.name,
+                            format!("{:?}", control.kind),
+                            control.x,
+                            control.y,
+                            control.pixel_width.unwrap_or(control.width),
+                            control.pixel_height.unwrap_or(control.height),
+                            control.value,
+                            control.hidden_parts,
+                            control.picture,
+                            control.label,
+                        );
+                    }
+                }
+            }
+            if std::env::args().any(|arg| arg == "--envelope-raw") {
+                for group in &instrument.groups {
+                    for child in &group.children {
+                        if child.id == 0x3B {
+                            let hex: Vec<String> = child
+                                .body
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                            println!(
+                                "  group {} 0x3B ({} B): {}",
+                                group.index,
+                                child.body.len(),
+                                hex.join(" ")
+                            );
+                        }
+                    }
+                }
+            }
+            if std::env::args().any(|arg| arg == "--envelopes") {
+                for group in &instrument.groups {
+                    match openkontakt::envelope::group_amp_envelope(group) {
+                        Some(env) => println!(
+                            "  group {} {}: attack {:.1} ms (curve {:.2}) hold {:.1} decay {:.1} sustain {:.3} release {:.1}",
+                            group.index,
+                            group.name,
+                            env.attack_ms,
+                            env.attack_curve,
+                            env.hold_ms,
+                            env.decay_ms,
+                            env.sustain,
+                            env.release_ms
+                        ),
+                        None => println!("  group {} {}: no envelope", group.index, group.name),
+                    }
+                }
+            }
             if std::env::args().any(|arg| arg == "--zones") {
                 for zone in instrument.zones.iter().take(20) {
                     println!(
