@@ -1,20 +1,26 @@
 use openkontakt::{Instrument, load_samples};
 
-/// Optional end-to-end check against the retail NFO library. Run with:
+/// Optional end-to-end check against a retail strings library. Run with:
 ///
 /// ```text
-/// OPENKONTAKT_NFO_NKI="…/NFO Chamber Strings Longs.nki" cargo test -p openkontakt --test real_library -- --ignored
+/// OPENKONTAKT_STRINGS_NKI="…/instrument.nki" cargo test -p openkontakt --test real_library -- --ignored
 /// ```
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn nfo_chamber_strings_longs_matches_verified_fixture() {
-    let path = std::env::var("OPENKONTAKT_NFO_NKI")
-        .expect("set OPENKONTAKT_NFO_NKI to NFO Chamber Strings Longs.nki");
+fn strings_instrument_matches_verified_fixture() {
+    let path = std::env::var("OPENKONTAKT_STRINGS_NKI")
+        .expect("set OPENKONTAKT_STRINGS_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     assert_eq!(instrument.groups.len(), 8);
     assert_eq!(instrument.zones.len(), 96);
     assert_eq!(instrument.program.version, 0xAB);
-    assert_eq!(instrument.program.params.name, "NFO Chamber Strings Longs");
+    assert_eq!(
+        instrument.program.params.name,
+        std::path::Path::new(&path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default()
+    );
     assert_eq!(instrument.program.private.len(), 356);
     assert_eq!(
         instrument.scripts.iter().filter(|s| !s.is_empty()).count(),
@@ -33,8 +39,13 @@ fn nfo_chamber_strings_longs_matches_verified_fixture() {
     let wallpaper = instrument
         .wallpaper_path
         .as_ref()
-        .expect("NFO ships Samples/Wallpaper/NFO_wallpaper.png");
-    assert!(wallpaper.ends_with("NFO_wallpaper.png"));
+        .expect("the library should ship a wallpaper");
+    assert!(
+        wallpaper
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("wallpaper")
+    );
     assert!(wallpaper.is_file());
 
     let loaded = load_samples(&instrument);
@@ -57,13 +68,13 @@ fn nfo_chamber_strings_longs_matches_verified_fixture() {
 /// must reach the engine's bus volume.
 ///
 /// ```text
-/// OPENKONTAKT_NFO_NKI="…/NFO Chamber Strings Longs.nki" cargo test -p openkontakt --test real_library -- --ignored
+/// OPENKONTAKT_STRINGS_NKI="…/instrument.nki" cargo test -p openkontakt --test real_library -- --ignored
 /// ```
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn nfo_panel_script_drives_bus_volume() {
-    let path = std::env::var("OPENKONTAKT_NFO_NKI")
-        .expect("set OPENKONTAKT_NFO_NKI to NFO Chamber Strings Longs.nki");
+fn strings_panel_script_drives_bus_volume() {
+    let path = std::env::var("OPENKONTAKT_STRINGS_NKI")
+        .expect("set OPENKONTAKT_STRINGS_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     let root = instrument
         .source_path
@@ -86,7 +97,7 @@ fn nfo_panel_script_drives_bus_volume() {
     let controls = runtime.controls(0);
     assert!(
         controls.len() >= 20,
-        "NFO declares 21 controls, got {}",
+        "the panel declares 21 controls, got {}",
         controls.len()
     );
     let mic = controls
@@ -106,7 +117,7 @@ fn nfo_panel_script_drives_bus_volume() {
                 .collect::<Vec<_>>(),
         );
     }
-    // NFO persists close=0, stereo pair=630000, outriggers=0, room=0.
+    // The saved state persists close=0, stereo pair=630000, outriggers=0, room=0.
     assert!(runtime.engine.bus_gain(1) > 0.99, "stereo pair bus");
     assert!(runtime.engine.bus_gain(0) < 0.01, "close bus muted");
 
@@ -115,18 +126,18 @@ fn nfo_panel_script_drives_bus_volume() {
     assert!(runtime.engine.bus_gain(0) > 0.99, "close bus after drag");
 }
 
-/// The Experience NY panel is the harder script: arrays, `on note` / `on release`, `select`, and
+/// A multi-microphone panel is the harder script: arrays, `on note` / `on release`, `select`, and
 /// pgs persistence keys. It must compile and initialize cleanly even though playback callbacks are
 /// not wired yet.
 ///
 /// ```text
-/// OPENKONTAKT_AMB_NKI="…/The Experience NY S&S Model B Ambisonic V1.0.nki" cargo test -p openkontakt --test real_library -- --ignored
+/// OPENKONTAKT_MULTIMIC_NKI="…/instrument.nki" cargo test -p openkontakt --test real_library -- --ignored
 /// ```
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn experience_ny_panels_compile_and_initialize() {
-    let path = std::env::var("OPENKONTAKT_AMB_NKI")
-        .expect("set OPENKONTAKT_AMB_NKI to The Experience NY S&S Model B Ambisonic V1.0.nki");
+fn multimic_panels_compile_and_initialize() {
+    let path = std::env::var("OPENKONTAKT_MULTIMIC_NKI")
+        .expect("set OPENKONTAKT_MULTIMIC_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     assert_eq!(instrument.zones.len(), 1263);
     let root = instrument
@@ -161,18 +172,18 @@ fn experience_ny_panels_compile_and_initialize() {
     }
 }
 
-/// `on note` / `on release` must actually route groups. The Experience NY panel splits its eight
+/// `on note` / `on release` must actually route groups. That panel splits its eight
 /// groups into four sustained and two-and-a-half… specifically: it disallows the release-trigger
 /// groups on note-on and allows only those on release.
 ///
 /// ```text
-/// OPENKONTAKT_AMB_NKI="…/Ambisonic V1.0.nki" cargo test -p openkontakt --test real_library -- --ignored
+/// OPENKONTAKT_MULTIMIC_NKI="…/instrument.nki" cargo test -p openkontakt --test real_library -- --ignored
 /// ```
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn experience_ny_note_and_release_route_groups() {
-    let path = std::env::var("OPENKONTAKT_AMB_NKI")
-        .expect("set OPENKONTAKT_AMB_NKI to The Experience NY S&S Model B Ambisonic V1.0.nki");
+fn multimic_note_and_release_route_groups() {
+    let path = std::env::var("OPENKONTAKT_MULTIMIC_NKI")
+        .expect("set OPENKONTAKT_MULTIMIC_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     let root = instrument
         .source_path
@@ -201,7 +212,7 @@ fn experience_ny_note_and_release_route_groups() {
     assert_eq!(
         release_groups.len(),
         2,
-        "Ambisonic has two release-trigger groups"
+        "the patch has two release-trigger groups"
     );
 
     let runtime = openkontakt::KspRuntime::compile_with_groups(&texts, &root, groups);
@@ -266,9 +277,9 @@ fn experience_ny_note_and_release_route_groups() {
 /// compile until `ui_table %steps[16](…)` was supported, which silently disabled the whole panel.
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn nfo_low_drone_panel_compiles_with_table_control() {
-    let path = std::env::var("OPENKONTAKT_LOW_DRONE_NKI")
-        .expect("set OPENKONTAKT_LOW_DRONE_NKI to NFO Chamber Strings Low Drone.nki");
+fn drone_panel_compiles_with_table_control() {
+    let path = std::env::var("OPENKONTAKT_DRONE_NKI")
+        .expect("set OPENKONTAKT_DRONE_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     let root = instrument
         .source_path
@@ -301,13 +312,13 @@ fn nfo_low_drone_panel_compiles_with_table_control() {
 /// engine value ("0.00 ms"). Combining them into one field made the name disappear.
 ///
 /// ```text
-/// OPENKONTAKT_NFO_NKI="…/NFO Chamber Strings Longs.nki" cargo test -p openkontakt --test real_library -- --ignored
+/// OPENKONTAKT_STRINGS_NKI="…/instrument.nki" cargo test -p openkontakt --test real_library -- --ignored
 /// ```
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn nfo_knobs_show_name_and_engine_value_separately() {
-    let path = std::env::var("OPENKONTAKT_NFO_NKI")
-        .expect("set OPENKONTAKT_NFO_NKI to NFO Chamber Strings Longs.nki");
+fn knobs_show_name_and_engine_value_separately() {
+    let path = std::env::var("OPENKONTAKT_STRINGS_NKI")
+        .expect("set OPENKONTAKT_STRINGS_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     let root = instrument
         .source_path
@@ -344,9 +355,9 @@ fn nfo_knobs_show_name_and_engine_value_separately() {
 /// `set_knob_label(..., get_engine_par_disp($ENGINE_PAR_ATTACK, 0, 0, -1))` from `on ui_control`.
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn nfo_attack_knob_readout_follows_the_knob() {
-    let path = std::env::var("OPENKONTAKT_NFO_NKI")
-        .expect("set OPENKONTAKT_NFO_NKI to NFO Chamber Strings Longs.nki");
+fn attack_knob_readout_follows_the_knob() {
+    let path = std::env::var("OPENKONTAKT_STRINGS_NKI")
+        .expect("set OPENKONTAKT_STRINGS_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     let root = instrument
         .source_path
@@ -390,12 +401,12 @@ fn nfo_attack_knob_readout_follows_the_knob() {
 }
 
 /// The streaming decoder must produce exactly what the old in-memory decoder (hound) produced.
-/// NFO samples are 24-bit, so this is the regression that made the library sound like noise.
+/// These samples are 24-bit, so this is the regression that made the library sound like noise.
 #[test]
 #[ignore = "requires a retail .nki + loose WAV library"]
-fn nfo_sample_decodes_like_hound() {
-    let path = std::env::var("OPENKONTAKT_NFO_NKI")
-        .expect("set OPENKONTAKT_NFO_NKI to NFO Chamber Strings Longs.nki");
+fn sample_decodes_like_hound() {
+    let path = std::env::var("OPENKONTAKT_STRINGS_NKI")
+        .expect("set OPENKONTAKT_STRINGS_NKI to the instrument to test");
     let instrument = Instrument::load(&path).expect("instrument should parse");
     let sample_path = instrument
         .resolved_samples
@@ -407,7 +418,7 @@ fn nfo_sample_decodes_like_hound() {
     let ours = openkontakt::wav::map_wav(&sample_path, 0).expect("mmap decode");
     let mut reader = hound::WavReader::open(&sample_path).expect("hound");
     let spec = reader.spec();
-    assert_eq!(spec.bits_per_sample, 24, "the NFO corpus is 24-bit");
+    assert_eq!(spec.bits_per_sample, 24, "this corpus is 24-bit");
     let hound: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let scale = 1.0f32 / (1u64 << (spec.bits_per_sample - 1)) as f32;
