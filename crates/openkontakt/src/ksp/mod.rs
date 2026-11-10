@@ -293,6 +293,8 @@ pub trait Host {
     fn panel_height(&mut self, _height: f32) {}
     /// `set_skin_offset`: which vertical band of the skin image this page shows.
     fn skin_offset(&mut self, _offset: f32) {}
+    /// `set_key_color`: recolour one key of the instrument's keyboard.
+    fn set_key_color(&mut self, _note: i64, _colour: i64) {}
     fn load_ir_sample(&mut self, _path: &str, _slot: i64, _generic: i64) -> bool {
         false
     }
@@ -380,6 +382,9 @@ pub struct EngineState {
     panel_heights: Mutex<HashMap<usize, f32>>,
     /// Per-slot `set_skin_offset` values.
     skin_offsets: Mutex<HashMap<usize, f32>>,
+    /// Keyboard swatches, shared by every slot the way `set_key_color` is shared in KONTAKT:
+    /// whichever script runs last decides what the key looks like.
+    key_colors: Mutex<KeyColours>,
 }
 
 impl Default for EngineState {
@@ -395,6 +400,7 @@ impl Default for EngineState {
             panel_height: Mutex::new(None),
             panel_heights: Mutex::new(HashMap::new()),
             skin_offsets: Mutex::new(HashMap::new()),
+            key_colors: Mutex::new([None; 128]),
         }
     }
 }
@@ -461,6 +467,29 @@ impl EngineState {
 
     pub fn panel_height(&self) -> Option<f32> {
         self.panel_height.lock().ok().and_then(|value| *value)
+    }
+
+    /// `set_key_color` for one key. Notes outside 0..127 are dropped: KONTAKT has no key there,
+    /// and `$KEY_COLOR_NONE` clears the swatch instead of storing a colour.
+    pub fn set_key_color(&self, note: i64, colour: i64) {
+        if !(0..128).contains(&note) {
+            return;
+        }
+        if let Ok(mut colours) = self.key_colors.lock() {
+            colours[note as usize] = if colour == KEY_COLOR_NONE {
+                None
+            } else {
+                Some(colour)
+            };
+        }
+    }
+
+    /// Every swatch a script has set so far.
+    pub fn key_colors(&self) -> KeyColours {
+        self.key_colors
+            .lock()
+            .map(|colours| *colours)
+            .unwrap_or([None; 128])
     }
 
     fn key(param: &str, group: i64, slot: i64, generic: i64) -> String {
@@ -711,6 +740,10 @@ impl Host for EngineHost {
         if let Ok(mut offsets) = self.state.skin_offsets.lock() {
             offsets.insert(self.slot, offset);
         }
+    }
+
+    fn set_key_color(&mut self, note: i64, colour: i64) {
+        self.state.set_key_color(note, colour);
     }
 
     fn load_ir_sample(&mut self, path: &str, _slot: i64, _generic: i64) -> bool {
@@ -1346,6 +1379,12 @@ impl<'a> Interp<'a> {
                 self.host.skin_offset(offset);
                 Ok(Value::Int(0))
             }
+            "set_key_color" => {
+                let note = self.eval_arg(args, 0)?;
+                let colour = self.eval_arg(args, 1)?;
+                self.host.set_key_color(note, colour);
+                Ok(Value::Int(0))
+            }
             "set_ui_height_px" => {
                 let height = self.eval_arg(args, 0)? as f32;
                 self.host.panel_height(height);
@@ -1570,9 +1609,81 @@ pub const INST_ICON_ID: i64 = INST_ID_BASE + 1;
 /// Bit in `$CONTROL_PAR_HIDE` that removes a control from the panel entirely.
 pub const HIDE_WHOLE_CONTROL: i64 = 16;
 
+/// `set_key_color` swatches, in KONTAKT's own order: `$KEY_COLOR_DEFAULT` is 0 and every later
+/// name is one higher. The order is the order the constants are listed in NI's reference; the
+/// names are what scripts pass, so this table is also how `$KEY_COLOR_*` is resolved.
+pub const KEY_COLOR_NAMES: [&str; 18] = [
+    "DEFAULT",
+    "RED",
+    "ORANGE",
+    "LIGHT_ORANGE",
+    "WARM_YELLOW",
+    "YELLOW",
+    "LIME",
+    "GREEN",
+    "MINT",
+    "CYAN",
+    "TURQUOISE",
+    "BLUE",
+    "PLUM",
+    "VIOLET",
+    "PURPLE",
+    "MAGENTA",
+    "FUCHSIA",
+    "INACTIVE",
+];
+
+/// `$KEY_COLOR_DEFAULT`: the blue KONTAKT paints every mapped key with.
+pub const KEY_COLOR_DEFAULT: i64 = 0;
+/// `$KEY_COLOR_INACTIVE`: paint the key as if nothing were mapped to it. Drum kits use this to
+/// hide everything outside their playing range, which is the "key range" the keyboard shows.
+pub const KEY_COLOR_INACTIVE: i64 = KEY_COLOR_NAMES.len() as i64 - 1;
+
+/// The three neutral colours: `set_key_color($n, $KEY_COLOR_NONE)` hands the key back to the
+/// zone mapping, and `$KEY_COLOR_BLACK`/`$KEY_COLOR_WHITE` force the unplayed look of a black or
+/// a white key, which is how libraries draw a keyboard bed over ranges they do not map.
+///
+/// They are numbered above the swatch list because they name the *absence* of a hue. KONTAKT's
+/// own numbers for them are not published; every retail script passes the name, never the value.
+pub const KEY_COLOR_NEUTRAL_BASE: i64 = KEY_COLOR_NAMES.len() as i64;
+pub const KEY_COLOR_NONE: i64 = KEY_COLOR_NEUTRAL_BASE;
+pub const KEY_COLOR_BLACK: i64 = KEY_COLOR_NEUTRAL_BASE + 1;
+pub const KEY_COLOR_WHITE: i64 = KEY_COLOR_NEUTRAL_BASE + 2;
+
+/// The `$KEY_COLOR_*` name behind a stored swatch, for diagnostics and tooling.
+pub fn key_color_name(index: i64) -> &'static str {
+    match index {
+        KEY_COLOR_NONE => "NONE",
+        KEY_COLOR_BLACK => "BLACK",
+        KEY_COLOR_WHITE => "WHITE",
+        other => KEY_COLOR_NAMES
+            .get(other as usize)
+            .copied()
+            .unwrap_or("UNKNOWN"),
+    }
+}
+
+/// What a script said about each key's keyboard colour. `None` is "the script never touched this
+/// key", which is not the same as `$KEY_COLOR_DEFAULT`: an untouched key keeps the default only
+/// if something is mapped to it.
+pub type KeyColours = [Option<i64>; 128];
+
 /// KSP constants that behave like integers. `$ENGINE_PAR_*` and `$CONTROL_PAR_*` are handled
 /// symbolically at their call sites, so only the arithmetic constants need values here.
 fn symbol(name: &str) -> Option<Value> {
+    // `$KEY_COLOR_*` is a numbered swatch list rather than a hand-written table, so the number
+    // and the name stay in one place.
+    if let Some(swatch) = name.strip_prefix("KEY_COLOR_") {
+        if let Some(index) = KEY_COLOR_NAMES.iter().position(|known| *known == swatch) {
+            return Some(Value::Int(index as i64));
+        }
+        match swatch {
+            "NONE" => return Some(Value::Int(KEY_COLOR_NONE)),
+            "BLACK" => return Some(Value::Int(KEY_COLOR_BLACK)),
+            "WHITE" => return Some(Value::Int(KEY_COLOR_WHITE)),
+            _ => {}
+        }
+    }
     Some(Value::Int(match name {
         "NI_BUS_OFFSET" => 1024,
         "KNOB_UNIT_DB" => 0,
@@ -2601,5 +2712,56 @@ mod tests {
         let controls = runtime.controls(0);
         assert_eq!(controls[0].hidden_parts & HIDE_WHOLE_CONTROL as u32, 0);
         assert_ne!(controls[1].hidden_parts & HIDE_WHOLE_CONTROL as u32, 0);
+    }
+
+    /// Drum kits paint the keyboard from `on init`: everything inactive, then one swatch per
+    /// playing key. Dropping those calls leaves the whole 128-key bed looking playable.
+    #[test]
+    fn set_key_color_paints_the_key_range() {
+        let text = r#"
+        on init
+          declare $n := 0
+          while ($n < 128)
+            set_key_color($n, $KEY_COLOR_INACTIVE)
+            inc($n)
+          end while
+          set_key_color(36, $KEY_COLOR_RED)
+          set_key_color(38, $KEY_COLOR_GREEN)
+          set_key_color(39, $KEY_COLOR_NONE)
+          set_key_color(200, $KEY_COLOR_BLUE)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        let colours = runtime.engine.key_colors();
+        let swatch = |name: &str| {
+            KEY_COLOR_NAMES
+                .iter()
+                .position(|known| *known == name)
+                .map(|index| index as i64)
+        };
+        assert_eq!(colours[36], swatch("RED"));
+        assert_eq!(colours[38], swatch("GREEN"));
+        assert_eq!(colours[0], Some(KEY_COLOR_INACTIVE));
+        assert_eq!(colours[60], Some(KEY_COLOR_INACTIVE));
+        // `$KEY_COLOR_NONE` hands the key back to the zone mapping instead of storing a swatch.
+        assert_eq!(colours[39], None);
+        // Out-of-range notes are dropped, and a key beyond 127 does not exist to paint.
+        assert_eq!(colours[127], Some(KEY_COLOR_INACTIVE));
+    }
+
+    #[test]
+    fn key_colour_constants_are_numbered_in_swatch_order() {
+        // `$KEY_COLOR_DEFAULT` is the blue every mapped key gets, and `$KEY_COLOR_INACTIVE` is
+        // last; the sixteen hues in between follow NI's listing order.
+        assert_eq!(symbol("KEY_COLOR_DEFAULT"), Some(Value::Int(0)));
+        assert_eq!(symbol("KEY_COLOR_RED"), Some(Value::Int(1)));
+        assert_eq!(symbol("KEY_COLOR_FUCHSIA"), Some(Value::Int(16)));
+        assert_eq!(symbol("KEY_COLOR_INACTIVE"), Some(Value::Int(17)));
+        // The neutral colours sit above the swatches and never collide with one.
+        assert_eq!(symbol("KEY_COLOR_NONE"), Some(Value::Int(KEY_COLOR_NONE)));
+        assert_eq!(symbol("KEY_COLOR_BLACK"), Some(Value::Int(KEY_COLOR_BLACK)));
+        assert_eq!(symbol("KEY_COLOR_WHITE"), Some(Value::Int(KEY_COLOR_WHITE)));
+        assert_eq!(symbol("KEY_COLOR_SOMETHING"), None);
     }
 }

@@ -9,6 +9,9 @@ use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::ParamSetter;
 use nice_plug::prelude::{FloatParam, Param};
 use nice_plug_egui::NiceEguiApp;
+use openkontakt::ksp::{
+    KeyColours, KEY_COLOR_BLACK, KEY_COLOR_DEFAULT, KEY_COLOR_INACTIVE, KEY_COLOR_WHITE,
+};
 use openkontakt::{KspControl, KspControlKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,7 +48,7 @@ const KEY_WHITE_DOWN: Color32 = Color32::from_rgb(181, 181, 181);
 const KEY_BLACK: Color32 = Color32::from_rgb(47, 47, 47);
 const KEY_BLACK_DOWN: Color32 = Color32::from_rgb(64, 64, 64);
 const KEY_GAP: Color32 = Color32::from_rgb(45, 58, 62);
-/// The 1 px rail where the keys meet the keybed chassis.
+/// The 1 px rail where the keys meet the keybed chassis, for keys in the default colour.
 const KEY_ROOT: Color32 = Color32::from_rgb(0, 201, 255);
 /// KONTAKT paints every mapped key (a zone covers it) with `$KEY_COLOR_DEFAULT`, its standard
 /// blue, and leaves unmapped keys black and white.
@@ -53,6 +56,158 @@ const KEY_WHITE_MAPPED: Color32 = Color32::from_rgb(129, 199, 218);
 const KEY_WHITE_MAPPED_DOWN: Color32 = Color32::from_rgb(118, 188, 207);
 const KEY_BLACK_MAPPED: Color32 = Color32::from_rgb(31, 101, 120);
 const KEY_BLACK_MAPPED_DOWN: Color32 = Color32::from_rgb(32, 80, 93);
+
+/// `set_key_color` swatches, indexed by the number a script passes. Entry 0 is
+/// `$KEY_COLOR_DEFAULT`, which is the same blue the keybed uses for mapped keys; the sixteen hues
+/// after it are KONTAKT's swatches, sampled from its own keyboard and stored as sRGB.
+const KEY_SWATCHES: [Color32; 17] = [
+    KEY_WHITE_MAPPED,                 // default
+    Color32::from_rgb(218, 145, 143), // red
+    Color32::from_rgb(218, 164, 145), // orange
+    Color32::from_rgb(217, 178, 122), // light orange
+    Color32::from_rgb(218, 205, 129), // warm yellow
+    Color32::from_rgb(218, 218, 129), // yellow
+    Color32::from_rgb(182, 218, 129), // lime
+    Color32::from_rgb(152, 218, 152), // green
+    Color32::from_rgb(129, 210, 182), // mint
+    Color32::from_rgb(129, 210, 210), // cyan
+    Color32::from_rgb(129, 199, 218), // turquoise
+    Color32::from_rgb(149, 176, 218), // blue
+    Color32::from_rgb(170, 163, 218), // plum
+    Color32::from_rgb(190, 162, 218), // violet
+    Color32::from_rgb(205, 156, 218), // purple
+    Color32::from_rgb(218, 152, 212), // magenta
+    Color32::from_rgb(218, 147, 169), // fuchsia
+];
+
+/// The black keys of a swatch: same hue, deeper and more saturated, which is how KONTAKT shades
+/// them. The two factors are fitted so the default key lands exactly on KONTAKT's sampled
+/// `(129,199,218)` → `(31,101,120)`.
+fn black_key_shade(colour: Color32) -> Color32 {
+    let (hue, saturation, value) = rgb_to_hsv([colour.r(), colour.g(), colour.b()]);
+    let [r, g, b] = hsv_to_rgb(hue, (saturation * 1.82).min(1.0), value * 0.55);
+    Color32::from_rgb(r, g, b)
+}
+
+/// Scale a colour's brightness, for the pressed state of a key.
+fn dim(colour: Color32, factor: f32) -> Color32 {
+    let scale = |channel: u8| (channel as f32 * factor).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(scale(colour.r()), scale(colour.g()), scale(colour.b()))
+}
+
+/// Hue in turns, plus saturation and value, all 0..1. Returns `(0, 0, 0)` for black.
+fn rgb_to_hsv([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+    let hue = if chroma == 0.0 {
+        0.0
+    } else if max == r {
+        (((g - b) / chroma) % 6.0) / 6.0
+    } else if max == g {
+        ((b - r) / chroma + 2.0) / 6.0
+    } else {
+        ((r - g) / chroma + 4.0) / 6.0
+    };
+    let hue = if hue < 0.0 { hue + 1.0 } else { hue };
+    let saturation = if max == 0.0 { 0.0 } else { chroma / max };
+    (hue, saturation, max)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [u8; 3] {
+    let sector = (hue.rem_euclid(1.0) * 6.0).min(5.999_999);
+    let chroma = value * saturation;
+    let secondary = chroma * (1.0 - ((sector % 2.0) - 1.0).abs());
+    let base = value - chroma;
+    let (r, g, b) = match sector as u32 {
+        0 => (chroma, secondary, 0.0),
+        1 => (secondary, chroma, 0.0),
+        2 => (0.0, chroma, secondary),
+        3 => (0.0, secondary, chroma),
+        4 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let to_byte = |channel: f32| ((channel + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+    [to_byte(r), to_byte(g), to_byte(b)]
+}
+
+/// The rail a key hangs from is the key's own colour, brighter: KONTAKT draws the 1 px line at the
+/// top of the keybed in a vivid version of the swatch. Six of them are measured from that keybed;
+/// the rest are the swatch taken to full saturation and value, which is what reproduces the
+/// measured default (`81C7DA` → `00C9FF`).
+fn rail_colour(index: i64) -> Color32 {
+    match openkontakt::ksp::KEY_COLOR_NAMES
+        .get(index as usize)
+        .copied()
+    {
+        Some("RED") => Color32::from_rgb(255, 45, 41),
+        Some("ORANGE") => Color32::from_rgb(255, 101, 47),
+        Some("LIGHT_ORANGE") => Color32::from_rgb(252, 141, 13),
+        Some("YELLOW") => Color32::from_rgb(255, 255, 0),
+        Some("GREEN") => Color32::from_rgb(65, 255, 65),
+        Some("BLUE") => Color32::from_rgb(59, 136, 255),
+        _ => {
+            let base = KEY_SWATCHES
+                .get(index.rem_euclid(KEY_SWATCHES.len() as i64) as usize)
+                .copied()
+                .unwrap_or(KEY_WHITE_MAPPED);
+            let (hue, _, _) = rgb_to_hsv([base.r(), base.g(), base.b()]);
+            let [r, g, b] = hsv_to_rgb(hue, 1.0, 1.0);
+            Color32::from_rgb(r, g, b)
+        }
+    }
+}
+
+/// The rail under one key, or `None` when the key gets no rail at all: keys outside the mapped
+/// range, and keys a script painted inactive, are not part of the instrument.
+fn key_rail(note: u8, mapped: bool, colours: Option<&KeyColours>) -> Option<Color32> {
+    match colours.and_then(|colours| colours[note as usize]) {
+        None | Some(KEY_COLOR_DEFAULT) => mapped.then_some(KEY_ROOT),
+        Some(KEY_COLOR_INACTIVE | KEY_COLOR_BLACK | KEY_COLOR_WHITE) => None,
+        Some(index) => Some(rail_colour(index)),
+    }
+}
+
+/// How one key is painted, in its up and pressed states.
+///
+/// Three inputs decide it: whether a zone covers the key, whether a script said anything about it,
+/// and whether it is a black key. A script's swatch wins over everything; `$KEY_COLOR_INACTIVE`
+/// gives the key back its unplayed look, which is how drum kits hide the keys they never use.
+fn key_paint(
+    note: u8,
+    white: bool,
+    mapped: bool,
+    colours: Option<&KeyColours>,
+) -> (Color32, Color32) {
+    let unplayed = match (white, mapped) {
+        (true, true) => (KEY_WHITE_MAPPED, KEY_WHITE_MAPPED_DOWN),
+        (true, false) => (KEY_WHITE, KEY_WHITE_DOWN),
+        (false, true) => (KEY_BLACK_MAPPED, KEY_BLACK_MAPPED_DOWN),
+        (false, false) => (KEY_BLACK, KEY_BLACK_DOWN),
+    };
+    let swatch = colours.and_then(|colours| colours[note as usize]);
+    match swatch {
+        // No script, or a script that only reaffirms the default: keep the sampled constants so
+        // the keybed looks exactly like it does without any scripting.
+        None | Some(KEY_COLOR_DEFAULT) => unplayed,
+        // Inactive, and the explicit black/white beds: the key looks unplayed, whatever the
+        // zones say. That is the trick drum kits and multi-instruments use to show a range.
+        Some(KEY_COLOR_INACTIVE | KEY_COLOR_BLACK | KEY_COLOR_WHITE) => {
+            if white {
+                (KEY_WHITE, KEY_WHITE_DOWN)
+            } else {
+                (KEY_BLACK, KEY_BLACK_DOWN)
+            }
+        }
+        Some(index) => {
+            let base = KEY_SWATCHES.get(index.rem_euclid(KEY_SWATCHES.len() as i64) as usize);
+            let base = base.copied().unwrap_or(KEY_WHITE_MAPPED);
+            let up = if white { base } else { black_key_shade(base) };
+            (up, dim(up, if white { 0.94 } else { 0.9 }))
+        }
+    }
+}
 
 /// Where the panel background comes from, and what it currently shows. Used to notice when the
 /// instrument changed and the texture has to be rebuilt.
@@ -1449,10 +1604,7 @@ impl OpenKontaktEditor {
                     .unwrap_or(400.0)
             };
             let scale = art.width() / ui_width;
-            let panel = Rect::from_min_size(
-                art.min,
-                Vec2::new(art.width(), ui_height * scale),
-            );
+            let panel = Rect::from_min_size(art.min, Vec2::new(art.width(), ui_height * scale));
             let image_height = image_size.y * scale;
             // A wallpaper a little taller than the panel is the panel's own artwork with its
             // edges bleeding over, and it is pinned to the bottom: that is what keeps the controls
@@ -1944,7 +2096,11 @@ impl OpenKontaktEditor {
                             // A button is momentary (the script decides what stays on, which is how
                             // radio groups are built); a switch toggles.
                             let value = if matches!(control.kind, KspControlKind::Button) {
-                                if control.value == 1 { 0 } else { 1 }
+                                if control.value == 1 {
+                                    0
+                                } else {
+                                    1
+                                }
                             } else {
                                 if control.value == 0 {
                                     control.max.max(1)
@@ -3121,17 +3277,21 @@ impl OpenKontaktEditor {
         // The keybed is painted before the status bar, and the bar overlaps the bottom of the
         // keys rect, so place the octave labels just above the bar.
         let label_y = DESIGN_HEIGHT - 28.0;
-        let mapped = self
-            .shared
-            .current()
+        let loaded = self.shared.current();
+        let mapped = loaded
+            .as_ref()
             .map(|loaded| loaded.instrument.mapped_keys());
+        // Scripts paint the keyboard themselves, so a drum kit can show its playing range and
+        // colour each piece. Without a script this stays `None` and every key keeps the default.
+        let colours = loaded.as_ref().map(|loaded| loaded.ksp.engine.key_colors());
         for (note, key) in &white_rects {
             let active = self.shared.is_note_active(*note) || self.mouse_note == Some(*note);
-            let (up, down) = if mapped.as_ref().is_some_and(|mapped| mapped[*note as usize]) {
-                (KEY_WHITE_MAPPED, KEY_WHITE_MAPPED_DOWN)
-            } else {
-                (KEY_WHITE, KEY_WHITE_DOWN)
-            };
+            let (up, down) = key_paint(
+                *note,
+                true,
+                mapped.as_ref().is_some_and(|mapped| mapped[*note as usize]),
+                colours.as_ref(),
+            );
             painter.rect_filled(*key, p.s(1.0), if active { down } else { up });
             if note % 12 == 0 {
                 // Kontakt prints only the octave group on each C key (C-2, C-1, C0 … C8).
@@ -3149,11 +3309,12 @@ impl OpenKontaktEditor {
 
         for (note, key) in &black_rects {
             let active = self.shared.is_note_active(*note) || self.mouse_note == Some(*note);
-            let (up, down) = if mapped.as_ref().is_some_and(|mapped| mapped[*note as usize]) {
-                (KEY_BLACK_MAPPED, KEY_BLACK_MAPPED_DOWN)
-            } else {
-                (KEY_BLACK, KEY_BLACK_DOWN)
-            };
+            let (up, down) = key_paint(
+                *note,
+                false,
+                mapped.as_ref().is_some_and(|mapped| mapped[*note as usize]),
+                colours.as_ref(),
+            );
             painter.rect_filled(*key, p.s(1.0), if active { down } else { up });
             painter.rect_stroke(
                 *key,
@@ -3163,25 +3324,38 @@ impl OpenKontaktEditor {
             );
         }
 
-        // The keybed root rail — the 1 px cyan line the keys hang from — only runs under the
-        // mapped range, so it marks the playable span exactly like KONTAKT's.
-        if let Some(mapped) = mapped.as_ref() {
-            let rail = hit_rects
-                .iter()
-                .filter(|(note, _)| mapped[*note as usize])
-                .map(|(_, rect)| rect);
-            let min_x = rail
-                .clone()
-                .fold(f32::INFINITY, |min, rect| min.min(rect.min.x));
-            let max_x = rail.fold(f32::NEG_INFINITY, |max, rect| max.max(rect.max.x));
-            if min_x <= max_x {
+        // The keybed root rail — the 1 px line the keys hang from — is the key's own colour, so
+        // it marks both the playable span and what each key does. White keys tile the full width,
+        // so painting each cell at its full cell width keeps the line unbroken across the 1 px
+        // gaps; the black keys then stamp their own colour over their part of it.
+        let rail_at = |note: u8| {
+            key_rail(
+                note,
+                mapped.as_ref().is_some_and(|mapped| mapped[note as usize]),
+                colours.as_ref(),
+            )
+        };
+        for (note, key) in &white_rects {
+            if let Some(colour) = rail_at(*note) {
                 painter.rect_filled(
                     Rect::from_min_size(
-                        Pos2::new(min_x, key_top - p.s(1.0)),
-                        Vec2::new(max_x - min_x, p.s(1.0)),
+                        Pos2::new(key.min.x, key_top - p.s(1.0)),
+                        Vec2::new(white_width, p.s(1.0)),
                     ),
                     0.0,
-                    KEY_ROOT,
+                    colour,
+                );
+            }
+        }
+        for (note, key) in &black_rects {
+            if let Some(colour) = rail_at(*note) {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(key.min.x, key_top - p.s(1.0)),
+                        Vec2::new(key.width(), p.s(1.0)),
+                    ),
+                    0.0,
+                    colour,
                 );
             }
         }
@@ -3967,6 +4141,97 @@ mod tests {
         assert!(editor.pictures_root.is_none());
         assert!(editor.background_source.is_none());
         assert!(editor.header_icon_source.is_none());
+    }
+
+    /// The black-key shading has to land on the values sampled from KONTAKT's own keybed, or
+    /// every swatch will drift away from the colour the same script draws in KONTAKT. The
+    /// samples below are white and black keys of one colour, measured in pairs.
+    #[test]
+    fn the_black_key_shade_matches_the_sampled_keys() {
+        assert_eq!(black_key_shade(KEY_WHITE_MAPPED), KEY_BLACK_MAPPED);
+        assert_eq!(
+            black_key_shade(Color32::from_rgb(218, 164, 145)),
+            Color32::from_rgb(120, 66, 47)
+        );
+        assert_eq!(
+            black_key_shade(Color32::from_rgb(218, 218, 129)),
+            Color32::from_rgb(120, 120, 31)
+        );
+        // Green lands one off on its darker channels, which is what a by-eye sample costs: the
+        // pair is still `218 → 120` on the bright channel, as the other two are.
+        let green = black_key_shade(Color32::from_rgb(152, 218, 152));
+        assert_eq!([green.r(), green.g(), green.b()], [54, 120, 54]);
+    }
+
+    #[test]
+    fn a_script_swatch_wins_over_the_mapped_default() {
+        let mut colours: openkontakt::ksp::KeyColours = [None; 128];
+        colours[36] = Some(1); // red
+        let (up, _) = key_paint(36, true, true, Some(&colours));
+        assert_eq!(up, KEY_SWATCHES[1]);
+        // The neighbouring key was never touched, so it keeps the default blue.
+        let (default, _) = key_paint(37, true, true, Some(&colours));
+        assert_eq!(default, KEY_WHITE_MAPPED);
+    }
+
+    /// The rail under each key is a vivid version of its swatch. These six are what the keybed
+    /// actually shows, so they are stored rather than derived.
+    #[test]
+    fn the_rail_colours_are_the_measured_ones() {
+        let swatch = |name: &str| {
+            openkontakt::ksp::KEY_COLOR_NAMES
+                .iter()
+                .position(|known| *known == name)
+                .expect("swatch") as i64
+        };
+        assert_eq!(rail_colour(swatch("RED")), Color32::from_rgb(255, 45, 41));
+        assert_eq!(rail_colour(swatch("GREEN")), Color32::from_rgb(65, 255, 65));
+        assert_eq!(
+            rail_colour(swatch("ORANGE")),
+            Color32::from_rgb(255, 101, 47)
+        );
+        assert_eq!(
+            rail_colour(swatch("LIGHT_ORANGE")),
+            Color32::from_rgb(252, 141, 13)
+        );
+        assert_eq!(
+            rail_colour(swatch("YELLOW")),
+            Color32::from_rgb(255, 255, 0)
+        );
+        assert_eq!(rail_colour(swatch("BLUE")), Color32::from_rgb(59, 136, 255));
+        // The default is the same blue at full strength, which is the cyan the keybed already had.
+        let default = rail_colour(swatch("DEFAULT"));
+        assert!(default.b() == KEY_ROOT.b());
+        assert!(default.g().abs_diff(KEY_ROOT.g()) <= 1, "{default:?}");
+    }
+
+    /// Keys that are not part of the instrument get no rail: that is what makes the line stop at
+    /// the edge of a drum kit's playing range.
+    #[test]
+    fn inactive_keys_have_no_rail() {
+        let mut colours: openkontakt::ksp::KeyColours = [None; 128];
+        colours[10] = Some(KEY_COLOR_INACTIVE);
+        colours[12] = Some(1);
+        assert_eq!(key_rail(10, true, Some(&colours)), None);
+        assert_eq!(key_rail(11, false, Some(&colours)), None);
+        assert_eq!(key_rail(11, true, Some(&colours)), Some(KEY_ROOT));
+        assert_eq!(key_rail(12, true, Some(&colours)), Some(rail_colour(1)));
+    }
+
+    /// `$KEY_COLOR_INACTIVE` is how a drum kit hides everything it does not map: the key goes
+    /// back to the unplayed look even though the instrument's zones cover it.
+    #[test]
+    fn an_inactive_key_looks_unplayed() {
+        let mut colours: openkontakt::ksp::KeyColours = [None; 128];
+        colours[10] = Some(KEY_COLOR_INACTIVE);
+        assert_eq!(
+            key_paint(10, true, true, Some(&colours)),
+            (KEY_WHITE, KEY_WHITE_DOWN)
+        );
+        assert_eq!(
+            key_paint(10, false, true, Some(&colours)),
+            (KEY_BLACK, KEY_BLACK_DOWN)
+        );
     }
 }
 

@@ -1,10 +1,12 @@
-use openkontakt::{Instrument, load_samples};
+use openkontakt::{load_samples, Instrument};
 use std::path::PathBuf;
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: ok-inspect <instrument.nki> [--samples] [--zones]");
+        eprintln!(
+            "usage: ok-inspect <instrument.nki> [--samples] [--zones] [--scripts] [--keys] [--dump]"
+        );
         std::process::exit(2);
     };
     let path = PathBuf::from(path);
@@ -65,6 +67,66 @@ fn main() {
                     "none"
                 }
             );
+            if std::env::args().any(|arg| arg == "--keys") {
+                // Key colours only exist once the scripts have run, so build the runtime here.
+                let root = instrument
+                    .source_path
+                    .parent()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                let texts: Vec<Option<String>> = instrument
+                    .scripts
+                    .iter()
+                    .map(|slot| slot.text.clone())
+                    .collect();
+                let groups: Vec<openkontakt::ksp::GroupInfo> = instrument
+                    .groups
+                    .iter()
+                    .map(|group| openkontakt::ksp::GroupInfo {
+                        release_trigger: group.release_trigger,
+                        envelope: openkontakt::envelope::group_amp_envelope(group),
+                    })
+                    .collect();
+                let runtime = openkontakt::KspRuntime::compile_with_groups(&texts, &root, groups);
+                runtime.initialize();
+                for message in runtime.diagnostics() {
+                    println!("  [ksp] {message}");
+                }
+                let colours = runtime.engine.key_colors();
+                let swatches: Vec<String> = colours
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(note, colour)| {
+                        colour.map(|index| {
+                            format!("{note}:{}", openkontakt::ksp::key_color_name(index))
+                        })
+                    })
+                    .collect();
+                println!("  key colours: {}", swatches.join(" "));
+            }
+            if std::env::args().any(|arg| arg == "--scripts") {
+                for slot in &instrument.scripts {
+                    let text = slot.text.as_deref().unwrap_or_default();
+                    println!(
+                        "  script {}: {} bytes, {} persistent, bypass={}{}",
+                        slot.index,
+                        text.len(),
+                        slot.persistent.len(),
+                        slot.bypass,
+                        if slot.password.is_empty() {
+                            String::new()
+                        } else {
+                            let hex: Vec<String> = slot
+                                .password
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                            format!(", password {} B [{}]", slot.password.len(), hex.join(" "))
+                        }
+                    );
+                    println!("{text}");
+                }
+            }
             // Round robin is *inferred*: see the note on `Group::round_robin`. Print the cycles
             // this reader believes in, so a library that looks wrong can be checked by eye.
             let mut grouped: std::collections::BTreeMap<Vec<u8>, Vec<(usize, String, u32)>> =
