@@ -6,7 +6,7 @@
 //! attack, decay, sustain or release.
 //!
 //! The layout is a flat record (no structured sections), documented in
-//! `docs/15-effects-and-modulation.md` §15.5.
+//! `docs/format.md` §3.6.
 
 use crate::group::Group;
 

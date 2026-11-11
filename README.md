@@ -15,6 +15,17 @@ The reader unwraps the real Kontakt container rather than looking for chunk ids 
        0x4B / 0x3D FileNameTable -> sample paths -> .wav / .ncw
 ```
 
+Two documents stand on their own, independent of this code:
+
+* [docs/format.md](docs/format.md) — the byte-level description of the files: container framing, the
+  chunk stream, the catalogue, the monolith archives and the sample codec.
+* [docs/playback.md](docs/playback.md) — how the original player turns those bytes into sound:
+  velocity, the amplitude envelope, tuning, gain staging, round robin.
+* [docs/ksp.md](docs/ksp.md) — the script language a player has to run: execution order, the event
+  object, group routing, the builtins that change the sound.
+* [docs/ksp-panel.md](docs/ksp-panel.md) — how a script draws its interface: the grid, sprites and
+  sidecars, pages made of hide bits, and where the wallpaper comes from.
+
 ## Status
 
 Implemented and validated against retail libraries from several vendors — pianos, a drum kit, two
@@ -58,9 +69,10 @@ electric guitars and a string collection:
 - **Linked controls**: writing a `ui_*` variable moves the widget without firing `on ui_control`,
   exactly as Kontakt does. A panel with dot handles relies on this: dragging a slider moves the
   dot, and dragging the dot moves the slider
-- **Menus and drag behaviour**: menus open a drop-down and report the chosen item through
-  `on ui_control`; `$CONTROL_PAR_MOUSE_BEHAVIOUR` negative values switch a control to relative
-  dragging (`|value|` pixels per full range), which is how the custom dot/line handles feel
+- **Menus**: a menu opens a drop-down and reports the chosen item through `on ui_control`, and its
+  range grows as rows are added. `$CONTROL_PAR_MOUSE_BEHAVIOUR` is parsed and kept, but relative
+  dragging is not implemented — a control whose script asks for it drags absolutely, so a custom
+  dot handle feels like a slider instead of a knob
 - **AHDSR amplitude envelopes**: read from each group's `0x3B → 0x0D → 0x07 → 0x3F` chain and
   applied per voice, with `$ENGINE_PAR_ATTACK/DECAY/SUSTAIN/RELEASE` overriding the stored values.
   A group can hold several envelopes (a filter one and a volume one); the amplifier envelope is
@@ -227,6 +239,13 @@ cargo run -q -p openkontakt --bin ok-inspect -- "<library>/<instrument>.nki" --d
 | `crates/openkontakt-plugin/src/engine.rs` | sampler engine |
 | `crates/openkontakt-plugin/src/editor.rs` | custom egui interface |
 | `crates/openkontakt/src/future.rs` | `unimplemented!()` stubs for out-of-scope containers |
+
+## Contributing
+
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) is short and mostly about the work: be civil, say how sure
+you are about a format claim, do not guess at undocumented bytes, and **update the section that
+documents whatever you change, in the same commit**. A capability that only exists in the code is a
+feature nobody finds; one that exists only in the README is a lie.
 
 ## License
 

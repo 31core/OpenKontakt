@@ -2,8 +2,7 @@
 //!
 //! This is **not** a KSP interpreter. It only mirrors what the library author declared through
 //! `declare ui_*`, `set_text`, `move_control`, `set_knob_unit` and `make_persistent` so a GUI can
-//! display the script's panel. Actual script execution is explicitly out of scope in
-//! `docs/18-scripts-and-ksp.md`. Values are taken from the slot's persisted user values when
+//! display the script's panel. Values are taken from the slot's persisted user values when
 //! present, otherwise from the declared default.
 
 use crate::script::ScriptSlot;

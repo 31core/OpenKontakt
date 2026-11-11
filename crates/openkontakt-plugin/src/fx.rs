@@ -4,7 +4,8 @@
 //! per-sample processors and keeps their state. Every parameter is read once when the instrument
 //! loads, so an effect never allocates or parses while audio is running.
 //!
-//! The parameter blocks are raw floats in native read order (see `docs/15-effects-and-modulation.md`).
+//! The parameter blocks are raw floats in native read order; `docs/format.md` §3.7 covers the rack
+//! and slot framing, and the per-module parameter layouts are undocumented.
 //! Kontakt's UI ranges are normalised, so the conversions here are documented guesses: a player has
 //! to pick a mapping, and these are the ones used by our engine.
 

@@ -35,8 +35,8 @@ pub fn parse_script(index: usize, body: &[u8]) -> Result<ScriptSlot> {
     match object.version {
         0x60 => parse_v60(index, object.flag, object.public, object.private),
         0x50 => unimplemented!(
-            "KSP script layout 0x50: docs/18-scripts-and-ksp.md §18.9 says the field layout \
-             beyond the first three strings has never been observed"
+            "KSP script layout 0x50: the field layout beyond the first three strings has never been \
+             observed, so this slot cannot be read"
         ),
         other => Err(Error::malformed(
             "BParScript",

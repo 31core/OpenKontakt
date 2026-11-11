@@ -1,8 +1,8 @@
 //! The NISound item tree container.
 //!
-//! Implements `docs/01-container-layers.md` and `docs/13-item-framing.md`. The chunk stream is
-//! located through `BNISoundPreset -> EncryptionItem -> SubtreeItem -> PresetChunkItem`, with the
-//! subtree payload expanded using FastLZ.
+//! Implements `docs/format.md` §2. The chunk stream is located through
+//! `BNISoundPreset -> EncryptionItem -> SubtreeItem -> PresetChunkItem`, with the subtree payload
+//! expanded using FastLZ.
 
 use crate::error::{Error, Result};
 use crate::fastlz;

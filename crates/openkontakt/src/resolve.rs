@@ -1,4 +1,4 @@
-//! Sample path resolution per `docs/08-samples-and-resolution.md` §08.6.
+//! Sample path resolution per `docs/format.md` §3.4.1.
 //!
 //! Resolution is deliberately conservative: exact base-relative matches first, then a lazily built
 //! case-insensitive basename index. Ambiguity is reported instead of guessed.

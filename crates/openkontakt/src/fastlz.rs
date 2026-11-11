@@ -1,7 +1,7 @@
 //! FastLZ level 1 and 2 decompression.
 //!
 //! Ported from the reference C implementation with every level-2 feature described in
-//! `docs/01-container-layers.md` §01.4. The output length is always compared by the caller.
+//! `docs/format.md` §2.6. The output length is always compared by the caller.
 
 use crate::error::{Error, Result};
 

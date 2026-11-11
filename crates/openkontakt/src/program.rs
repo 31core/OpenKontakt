@@ -159,14 +159,14 @@ fn parse_public(public: &[u8], version: u16) -> Result<ProgramParams> {
 
     let suffix_start = reader.offset_in_slice();
     // The suffix table is known for the verified versions. For newer generations the stored
-    // bytes outrun the table in `docs/03`; those bytes are preserved instead of guessed at.
+    // bytes outrun the table in every observed file; those bytes are preserved instead of guessed at.
     let _ = parse_suffix(&mut reader, version);
     // Keep the complete suffix. For B3+ the observed bytes outrun the published token table, so
     // the unconsumed remainder must not be dropped.
     params.suffix_bytes = public.len() - suffix_start;
     params.suffix = public[suffix_start..].to_vec();
     // F2 is the terminal signed filename reference for every schema that has it (>= 0xA2).
-    // The token table in docs/03 places it last; this remains true for the newer 0xB3-0xB5
+    // The token order places it last; this remains true for the newer 0xB3-0xB5
     // generations whose intermediate suffix bytes outrun that table.
     if version >= 0xA2 && params.suffix.len() >= 4 {
         let tail = &params.suffix[params.suffix.len() - 4..];
@@ -179,7 +179,7 @@ fn parse_public(public: &[u8], version: u16) -> Result<ProgramParams> {
 }
 
 /// Consume the version-specific suffix. Tokens are exactly the ones tabulated in
-/// `docs/03-nki-instrument.md` §03.4. `S` is only accepted when absent; a present BNISoundData
+/// `docs/format.md` §3.1. `S` is only accepted when absent; a present BNISoundData
 /// body is not decoded in the docs yet.
 fn parse_suffix(reader: &mut Reader<'_>, version: u16) -> Result<()> {
     let s0 = matches!(version, 0xB0..=0xB5);
