@@ -153,7 +153,30 @@ and will not run in real time. Truncating at the point where the response falls 
 and capping the length at 12 s made one such instrument's output bit-identical (a −209 dB
 difference) and cut a 20-second render from 61.5 s to 6.3 s. [verified]
 
-## 8. What is not established
+## 8. Voices and polyphony
+
+**8.1 One voice per matched zone.** A voice is one sample playing. A note-on that matches several
+zones — one per microphone, and a second velocity layer while a crossfade is in progress — starts
+one voice for each, and each of the group's release-trigger zones adds another on note-off. A
+two-microphone piano therefore spends four to six voices per note-on and two to four per note-off,
+which means a dense passage asks for far more than the number of keys it is playing. [verified]
+
+**8.2 The limit is a limit, not a queue.** When the polyphony is reached, some voice has to go, and
+which one is audible. The voice to lose is the one nobody can hear: a released voice before a
+sounding one, and among those the quietest. Choosing by age does the opposite, because the oldest
+voice is the note held longest — the sustained bass. Measured on a two-microphone piano, age-based
+stealing cut a held note at 88 % of its level on a passage that also had a hundred release tails
+open at −45 dB, and the cut is heard exactly as a release that fell to zero. [verified]
+
+**8.3 A stolen voice fades.** Stopping a sounding voice at a sample boundary is a step, and a step is
+a click. A few milliseconds of fade removes it and is too short to be heard as part of a note;
+**5 ms** is used here. [open — the length is a choice, not a measurement]
+
+**8.4 Silent voices give up their slots.** A one-shot envelope decays to a zero sustain and stays
+there; a player that keeps such a voice "active" slowly fills its pool with inaudible voices, and
+the polyphony collapses long before the note count says it should.
+
+## 9. What is not established
 
 * The exact curve law of an AHDSR stage; only its endpoints and monotonicity are pinned.
 * The normalised-knob mapping away from the one anchor point (0.586 ↔ 500 ms).

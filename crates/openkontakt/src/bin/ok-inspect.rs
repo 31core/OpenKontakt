@@ -1,11 +1,27 @@
 use openkontakt::{load_samples, Instrument};
 use std::path::PathBuf;
 
+/// Put the saved values into the runtime before anything reads it.
+///
+/// A patch is not its declarations: a loaded instrument shows the values saved with it, and some
+/// panels only lay themselves out in the `on ui_control` handlers those values replay.
+fn restore_stored_values(runtime: &openkontakt::KspRuntime, instrument: &Instrument) {
+    for slot in &instrument.scripts {
+        let entries: Vec<(String, Vec<i64>)> = slot
+            .persistent
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.values.clone()))
+            .collect();
+        runtime.apply_persistent(slot.index, &entries);
+    }
+}
+
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let Some(path) = args.next() else {
         eprintln!(
-            "usage: ok-inspect <instrument.nki> [--samples] [--zones] [--scripts] [--keys] [--dump]"
+            "usage: ok-inspect <instrument.nki> [--samples] [--zones] [--scripts] [--persistent] \
+             [--keys] [--dump]"
         );
         std::process::exit(2);
     };
@@ -89,6 +105,7 @@ fn main() {
                     .collect();
                 let runtime = openkontakt::KspRuntime::compile_with_groups(&texts, &root, groups);
                 runtime.initialize();
+                restore_stored_values(&runtime, &instrument);
                 for message in runtime.diagnostics() {
                     println!("  [ksp] {message}");
                 }
@@ -125,6 +142,26 @@ fn main() {
                         }
                     );
                     println!("{text}");
+                }
+            }
+            if std::env::args().any(|arg| arg == "--persistent") {
+                for slot in &instrument.scripts {
+                    for entry in &slot.persistent {
+                        let head: Vec<String> = entry
+                            .values
+                            .iter()
+                            .take(6)
+                            .map(|value| value.to_string())
+                            .collect();
+                        println!(
+                            "  persistent slot {} {:?}: {} value(s) [{}]{}",
+                            slot.index,
+                            entry.name,
+                            entry.values.len(),
+                            head.join(" "),
+                            if entry.values.len() > 6 { " ..." } else { "" }
+                        );
+                    }
                 }
             }
             // Round robin is *inferred*: see the note on `Group::round_robin`. Print the cycles
@@ -245,6 +282,7 @@ fn main() {
                     .collect();
                 let runtime = openkontakt::KspRuntime::compile_with_groups(&texts, &root, groups);
                 runtime.initialize();
+                restore_stored_values(&runtime, &instrument);
                 // `--press NAME` runs that control's `on ui_control`, which is what a click does.
                 if let Some(position) = std::env::args().position(|arg| arg == "--press") {
                     if let Some(name) = std::env::args().nth(position + 1) {
@@ -259,8 +297,26 @@ fn main() {
                 }
                 for slot in 0..runtime.slot_count() {
                     for control in runtime.controls(slot) {
+                        // A table is bound to an array, so say what it currently holds; an empty
+                        // one draws no bars and looks like a broken panel.
+                        let table = if control.kind == openkontakt::ksp::parser::UiKind::Table {
+                            let head: Vec<String> = control
+                                .table
+                                .iter()
+                                .take(6)
+                                .map(|value| value.to_string())
+                                .collect();
+                            format!(
+                                " table={} [{}]{}",
+                                control.table.len(),
+                                head.join(" "),
+                                if control.table.len() > 6 { " ..." } else { "" }
+                            )
+                        } else {
+                            String::new()
+                        };
                         println!(
-                            "  slot {} {:>10} {:>9} {:>5},{:<5} {:>4}x{:<4} value={:<6} hidden={:<3} picture={:?} text={:?}",
+                            "  slot {} {:>10} {:>9} {:>5},{:<5} {:>4}x{:<4} value={:<6} hidden={:<3} picture={:?} text={:?}{table}",
                             slot,
                             control.name,
                             format!("{:?}", control.kind),

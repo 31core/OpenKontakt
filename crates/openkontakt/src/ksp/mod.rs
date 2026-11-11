@@ -1854,11 +1854,15 @@ impl KspRuntime {
             let bare = name.trim_start_matches('$');
             if let Some(control) = state.ui.iter_mut().find(|c| c.name == bare) {
                 control.value = first;
-                // A `ui_button` handler runs on a click, not on a restore. One panel's three
-                // direction buttons each `call all_off1` and then set themselves to 1 whoever fires,
-                // so replaying them turned the stored first-button selection into the last one.
-                // Switches and knobs do need the replay — engine state hangs off them.
-                if control.kind != UiKind::Button {
+                // A knob or a switch owns engine state, so its handler is replayed. A button is
+                // normally a click rather than a restore — but a button stored as *pressed* is
+                // the saved selection of a radio group, and its handler is what lays out the page
+                // that selection belongs to: one panel only moves its step table into view from
+                // the tab button's handler, so skipping every button left the table parked at
+                // (0,0) and the panel empty until the user clicked the tab.
+                // Replaying only the pressed buttons also keeps the other panel's three direction
+                // buttons from all firing at once, which used to leave the last one selected.
+                if control.kind != UiKind::Button || first != 0 {
                     changed.push(bare.to_string());
                 }
             }
@@ -2416,6 +2420,80 @@ mod tests {
             1,
             "the saved value must survive the handler replay"
         );
+    }
+
+    /// A button stored as *pressed* is the saved selection of a radio group, and its handler is
+    /// what lays the page out: one panel's tab button is the only thing that moves the four step
+    /// tables into view. Skipping every button on restore left the tab looking selected, the
+    /// table at (0, 0) and the panel with a frozen, empty editor until the user clicked it.
+    #[test]
+    fn a_pressed_button_is_replayed_so_the_page_lays_out() {
+        let text = r#"
+        on init
+          declare ui_button $Tab
+          make_persistent($Tab)
+          read_persistent_var($Tab)
+          declare ui_table %Steps[4](0, 127, 127)
+          make_persistent(%Steps)
+          read_persistent_var(%Steps)
+        end on
+        on ui_control($Tab)
+          move_control_px(%Steps, 16, 235)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        runtime.apply_persistent(
+            0,
+            &[
+                ("$Tab".to_string(), vec![1]),
+                ("%Steps".to_string(), vec![1, 2, 3, 4]),
+            ],
+        );
+        let controls = runtime.controls(0);
+        let table = controls
+            .iter()
+            .find(|control| control.name == "Steps")
+            .expect("the table should exist");
+        assert_eq!(
+            (table.x, table.y),
+            (16, 235),
+            "the saved tab must run its handler, which is what places the table"
+        );
+        assert_eq!(table.table, vec![1, 2, 3, 4]);
+    }
+
+    /// The same restore must not fire a button that was saved *unpressed*: one panel's three
+    /// direction buttons each turn the others off and then turn themselves on, so replaying all
+    /// of them left the last one selected whatever the user had chosen.
+    #[test]
+    fn an_unpressed_button_stays_where_it_was() {
+        let text = r#"
+        on init
+          declare ui_button $First
+          declare ui_button $Second
+          make_persistent($First)
+          make_persistent($Second)
+          read_persistent_var($First)
+          read_persistent_var($Second)
+        end on
+        on ui_control($Second)
+          $First := 0
+          $Second := 1
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        runtime.apply_persistent(
+            0,
+            &[
+                ("$First".to_string(), vec![1]),
+                ("$Second".to_string(), vec![0]),
+            ],
+        );
+        let controls = runtime.controls(0);
+        let first = controls.iter().find(|c| c.name == "First").unwrap();
+        assert_eq!(first.value, 1, "the saved selection must survive the restore");
     }
 
     #[test]

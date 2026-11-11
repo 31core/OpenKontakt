@@ -108,6 +108,11 @@ current page — usually by a `function show_<page>` that sets the background pi
 thirteen-odd `$CONTROL_PAR_HIDE` values. A renderer that ignores the whole-control bit draws every
 page on top of every other one. [verified]
 
+The same function is what *places* the page's controls, and it is reached through the page button's
+`on ui_control` handler. A saved patch therefore has a page that is already selected but laid out
+only once that handler runs: a player that restores the button's value without replaying the
+handler draws the right page with its tables still parked off-panel.
+
 **5.3 Page buttons.** A page button is a `ui_button` whose *picture* is swapped between an `…_On`
 and an `…_Off` sprite: the highlight is a different image, not a colour or a size. The button also
 holds 1 while its page is current, which is what makes a radio group out of five buttons. [verified]

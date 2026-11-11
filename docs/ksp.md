@@ -31,6 +31,12 @@ playable, and the `on ui_control` handler of every restored control is re-run so
 matching the panel. Skipping that replay loads the right numbers and plays the wrong sound — a
 mixer whose faders show the saved mix while the engine sits at the script's defaults.
 
+A **button** is the exception that proves the rule: a handler there is a click, and replaying one
+that was saved *unpressed* is a click that never happened. A button saved as pressed is different —
+it is the stored selection of a radio group, and its handler is often the only thing that lays the
+page out (a tab button is what moves the step tables into view). Replay pressed buttons, not the
+rest. Replaying every button in a radio group makes the last one win, whatever was saved.
+
 **1.5 Isolation.** A script that fails to parse is reported and skipped; it must not take the other
 four with it, and it must not take the instrument with it.
 
@@ -87,12 +93,16 @@ and can change what happens to it:
 groups a note is played from — the mechanism behind a drum kit playing only the snare groups for
 D1, and behind a multi-mic patch dropping its release groups on note-on.
 
-Two rules keep this working:
+Three rules keep this working:
 
 * the routing is per event, not global, and a note that never called either builtin plays every
   group;
 * `$ALL_GROUPS` is a sentinel value (`-1`), not "all group indices" — a script that loops over
-  groups still needs `allow_group` afterwards.
+  groups still needs `allow_group` afterwards;
+* `on release` routes the **release-trigger groups**, and it routes them with the same two
+  builtins. A piano declares one release set per articulation, so a player that ignores the
+  release routing fires the release samples of every articulation at once — two voices per
+  note-off can become ten, and the wrong articulation's release is the one heard.
 
 ## 6. Engine and panel builtins
 

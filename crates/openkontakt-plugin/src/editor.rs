@@ -2716,12 +2716,17 @@ impl OpenKontaktEditor {
         match control.kind {
             KspControlKind::Label => {
                 // Only the label has a backing bar; KSP does not draw one big frame around a
-                // whole section.
-                painter.rect_filled(
-                    cell,
-                    p.s(2.0),
-                    Color32::from_rgba_unmultiplied(20, 16, 12, 190),
-                );
+                // whole section. `hide_part($label, $HIDE_PART_BG)` means the text sits on the
+                // artwork with no box of its own — a panel's value read-outs are declared that
+                // way, and painting their bars anyway merges a row of them into one long dark
+                // strip across the module.
+                if control.hidden_parts & 1 == 0 {
+                    painter.rect_filled(
+                        cell,
+                        p.s(2.0),
+                        Color32::from_rgba_unmultiplied(20, 16, 12, 190),
+                    );
+                }
                 let max_width = (cell.width() / p.scale - 10.0 * k).max(12.0);
                 p.text_fit(
                     painter,

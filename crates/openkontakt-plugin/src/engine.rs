@@ -11,7 +11,15 @@ use openkontakt::{AudioSample, SampleCursor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const MAX_VOICES: usize = 128;
+/// How many voices may sound at once. The pool is larger than this, because a voice that loses
+/// its slot spends a few milliseconds fading out instead of stopping dead.
+const POLYPHONY: usize = 128;
+/// Extra slots for voices that were just stolen and are fading out.
+const STEAL_SLOTS: usize = 16;
+const MAX_VOICES: usize = POLYPHONY + STEAL_SLOTS;
+/// Length of that fade. Long enough that a cut is not a step, short enough that it is not a note
+/// of its own.
+const STEAL_FADE_MS: f32 = 5.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnvelopeStage {
@@ -147,6 +155,10 @@ struct Voice {
     base_gain: f32,
     env: Envelope,
     age: u64,
+    /// Fade applied when the voice has been stolen: `fade_gain` falls to zero at `fade_step` per
+    /// sample. `fade_step == 0` means the voice is not being stolen.
+    fade_gain: f32,
+    fade_step: f32,
     /// Which bus this voice feeds. Scripts drive bus volumes through `$NI_BUS_OFFSET`.
     bus: usize,
     /// `$EVENT_ID` of the note that started this voice, for `note_off()` from a script.
@@ -182,6 +194,8 @@ impl Default for Voice {
                 release_left: 0.0,
             },
             age: 0,
+            fade_gain: 1.0,
+            fade_step: 0.0,
             bus: 0,
             event_id: 0,
         }
@@ -619,11 +633,14 @@ impl Engine {
                     }
                     self.execute_actions(&result.dispatch.actions, allowed.as_deref());
                 }
-                ScriptCommand::NoteOff { .. } => {
-                    self.execute_actions(
-                        &result.dispatch.actions,
-                        result.dispatch.allowed_groups.as_deref(),
-                    );
+                ScriptCommand::NoteOff { key, velocity, .. } => {
+                    let allowed = result.dispatch.allowed_groups.clone();
+                    // The release-trigger groups are chosen by `on release`, exactly like the
+                    // note-on groups are chosen by `on note`: a script that disallows every group
+                    // and then allows only its release sets must not get release samples from
+                    // every articulation in the instrument.
+                    self.trigger_phase(key, velocity, allowed.as_deref(), TriggerPhase::NoteOff);
+                    self.execute_actions(&result.dispatch.actions, allowed.as_deref());
                 }
                 ScriptCommand::Controller { .. } => {
                     self.execute_actions(
@@ -759,9 +776,14 @@ impl Engine {
             }
         }
         let velocity = self.event_velocity[key as usize & 127];
-        // The release-trigger groups are part of the instrument's normal group set; a script that
-        // only routes note-on groups would otherwise silence every release sample.
-        self.trigger_phase(key, velocity, None, TriggerPhase::NoteOff);
+        // Same allowlist as note-on: `on release` disallows every group and allows the release
+        // sets, so ignoring it fires the release samples of every articulation at once.
+        self.trigger_phase(
+            key,
+            velocity,
+            dispatch.allowed_groups.as_deref(),
+            TriggerPhase::NoteOff,
+        );
         self.execute_actions(&dispatch.actions, dispatch.allowed_groups.as_deref());
     }
 
@@ -1082,6 +1104,8 @@ impl Engine {
                 base_gain,
                 env: Envelope::new(envelope, self.sample_rate),
                 age: 0,
+                fade_gain: 1.0,
+                fade_step: 0.0,
                 // 255 is the "no explicit output bus" sentinel, not bus 255.
                 bus: match group.private_bus {
                     Some(bus) if bus < 16 => bus as usize,
@@ -1090,8 +1114,15 @@ impl Engine {
                 event_id,
             });
         }
-        if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() && phase == TriggerPhase::NoteOff {
-            eprintln!("debug: release trigger for {key} started {started} voices");
+        if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() {
+            if phase == TriggerPhase::NoteOff {
+                eprintln!("debug: release trigger for {key} started {started} voices");
+            } else {
+                eprintln!(
+                    "debug: note-on for {key} started {started} voices, {} active",
+                    self.voice_count()
+                );
+            }
         }
     }
 
@@ -1133,36 +1164,96 @@ impl Engine {
         envelope
     }
 
+    /// Put a voice in the pool, making room if the polyphony limit is reached.
+    ///
+    /// Stealing by age — the earlier rule — kills the *oldest sounding* voice, and the oldest
+    /// voice is the one held longest: the sustained bass. On a dense piano score with long release
+    /// samples the pool saturates within seconds, and from then on every new note cuts a held
+    /// note, which is heard as a release that fell to zero. The voices that should go first are
+    /// the ones nobody can hear — a release tail 45 dB down, not a note at full level.
     fn start_voice(&mut self, mut voice: Voice) {
         self.age_counter = self.age_counter.wrapping_add(1);
         voice.age = self.age_counter;
+
+        let live = self
+            .voices
+            .iter()
+            .filter(|slot| slot.active && slot.fade_step == 0.0)
+            .count();
+        if live >= POLYPHONY || self.voices.iter().all(|slot| slot.active) {
+            if let Some(index) = self.steal_candidate() {
+                let fade = (STEAL_FADE_MS / 1000.0 * self.sample_rate).max(1.0);
+                let victim = &mut self.voices[index];
+                if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() {
+                    eprintln!(
+                        "debug: stealing note {} ({:?} level {:.4}) for note {}",
+                        victim.note, victim.env.stage, victim.env.level, voice.note
+                    );
+                }
+                victim.fade_gain = 1.0;
+                victim.fade_step = 1.0 / fade;
+            }
+        }
         if let Some(slot) = self.voices.iter_mut().find(|slot| !slot.active) {
             *slot = voice;
             return;
         }
-        if let Some(slot) = self.voices.iter_mut().min_by_key(|slot| slot.age) {
+        // No slot is free, so every slot is live or fading. The quietest fade is the closest to
+        // silence; dropping that one outright is what its own fade was about to do anyway.
+        let quietest = self
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.fade_step > 0.0)
+            .min_by(|a, b| a.1.fade_gain.total_cmp(&b.1.fade_gain))
+            .map(|(index, _)| index);
+        if let Some(index) = quietest {
+            self.voices[index] = voice;
+        } else if let Some(slot) = self.voices.iter_mut().min_by_key(|slot| slot.age) {
             *slot = voice;
         }
     }
 
+    /// The voice that can be lost with the least damage: a released voice before a sounding one,
+    /// and within a group the quietest. Level is the envelope times the voice's own gain, so a
+    /// nearly decayed note counts as quiet even while its envelope still says "sustain".
+    fn steal_candidate(&self) -> Option<usize> {
+        let mut best: Option<(usize, u8, f32)> = None;
+        for (index, voice) in self.voices.iter().enumerate() {
+            if !voice.active || voice.fade_step > 0.0 {
+                continue;
+            }
+            let released = matches!(voice.env.stage, EnvelopeStage::Release | EnvelopeStage::Off);
+            let rank = if released { 0 } else { 1 };
+            let level = voice.env.level * voice.base_gain;
+            let better = match best {
+                None => true,
+                Some((_, best_rank, best_level)) => {
+                    rank < best_rank || (rank == best_rank && level < best_level)
+                }
+            };
+            if better {
+                best = Some((index, rank, level));
+            }
+        }
+        best.map(|(index, _, _)| index)
+    }
+
     pub fn note_off(&mut self, key: u8) {
         let id = self.event_ids[key as usize & 127];
-        if let Some(worker) = self.script.as_mut() {
-            worker.submit(ScriptCommand::NoteOff {
-                key,
-                velocity: self.event_velocity[key as usize & 127],
-                id,
-            });
-        }
-        // The voices release immediately; the script's `on release` runs on the worker and adds
-        // release samples when it asks for them.
+        let velocity = self.event_velocity[key as usize & 127];
+        // The sounding voices release immediately; the release-trigger samples wait for the
+        // script, whose `on release` decides which groups may play them.
         for voice in &mut self.voices {
             if voice.active && voice.note == key && voice.env.stage != EnvelopeStage::Release {
                 voice.env.release();
             }
         }
-        let velocity = self.event_velocity[key as usize & 127];
-        self.trigger_phase(key, velocity, None, TriggerPhase::NoteOff);
+        if let Some(worker) = self.script.as_mut() {
+            worker.submit(ScriptCommand::NoteOff { key, velocity, id });
+        } else {
+            self.trigger_phase(key, velocity, None, TriggerPhase::NoteOff);
+        }
     }
 
     pub fn choke_all(&mut self) {
@@ -1197,19 +1288,28 @@ impl Engine {
             let gain = voice.env.next();
             // The envelope reaches `Off` by itself when a linear release lands on zero, so the
             // voice has to be retired here; otherwise it stays "active" (silent) forever and the
-            // pool slowly fills with corpses.
+            // pool slowly fills with corpses. A one-shot envelope whose decay has landed on a
+            // zero sustain is silent too, and holding a slot for it starves the pool the same way.
             if voice.env.stage == EnvelopeStage::Off || gain <= 0.0 {
-                if voice.env.stage == EnvelopeStage::Release {
-                    voice.env.stage = EnvelopeStage::Off;
-                }
-                if voice.env.stage == EnvelopeStage::Off {
-                    voice.active = false;
-                }
+                voice.env.stage = EnvelopeStage::Off;
+                voice.active = false;
                 continue;
             }
 
             let (sample_left, sample_right) = voice.sample.sample_at(voice.position);
-            let mix = voice.base_gain * gain;
+            let fade = if voice.fade_step > 0.0 {
+                let fade = voice.fade_gain;
+                voice.fade_gain -= voice.fade_step;
+                if voice.fade_gain <= 0.0 {
+                    voice.active = false;
+                    voice.fade_step = 0.0;
+                    voice.env.stage = EnvelopeStage::Off;
+                }
+                fade.max(0.0)
+            } else {
+                1.0
+            };
+            let mix = voice.base_gain * gain * fade;
             let bus = voice.bus.min(15);
             self.bus_left[bus] += sample_left * voice.gain_left * mix;
             self.bus_right[bus] += sample_right * voice.gain_right * mix;
@@ -1461,6 +1561,162 @@ mod tests {
             }
         }
         best
+    }
+
+    /// The pool is a polyphony limit, not a queue: the voice that loses its slot has to be one
+    /// nobody can hear. Stealing by age did the opposite — the oldest voice is the note held
+    /// longest, so on a dense piano score every new note cut the sustained bass while a hundred
+    /// release tails at -50 dB kept theirs.
+    #[test]
+    fn steals_a_release_tail_rather_than_a_held_note() {
+        let mut engine = Engine::default();
+        engine.set_sample_rate(48_000.0);
+
+        // The held note is the oldest voice, which is exactly what made it the age-based victim.
+        let mut held = Voice::default();
+        held.active = true;
+        held.note = 41;
+        held.env.stage = EnvelopeStage::Sustain;
+        held.env.level = 0.9;
+        held.base_gain = 0.5;
+        held.age = 1;
+        engine.voices[0] = held;
+
+        for index in 1..MAX_VOICES {
+            let mut tail = Voice::default();
+            tail.active = true;
+            tail.note = 60 + (index % 12) as u8;
+            tail.env.stage = EnvelopeStage::Release;
+            tail.env.level = 0.002;
+            tail.base_gain = 0.3;
+            tail.age = 10 + index as u64;
+            engine.voices[index] = tail;
+        }
+
+        assert_eq!(
+            engine.steal_candidate(),
+            Some(1),
+            "a release tail should lose its slot, not the held note"
+        );
+    }
+
+    /// With nothing released left to steal, the quietest sounding voice goes — not the oldest.
+    #[test]
+    fn steals_the_quietest_held_voice_when_nothing_is_released() {
+        let mut engine = Engine::default();
+        engine.set_sample_rate(48_000.0);
+
+        for (index, (level, gain)) in [(0.9, 0.5), (0.2, 1.0), (0.6, 0.2)].into_iter().enumerate() {
+            let mut voice = Voice::default();
+            voice.active = true;
+            voice.note = 40 + index as u8;
+            voice.env.stage = EnvelopeStage::Sustain;
+            voice.env.level = level;
+            voice.base_gain = gain;
+            voice.age = index as u64;
+            engine.voices[index] = voice;
+        }
+
+        // 0.9 x 0.5 = 0.45, 0.2 x 1.0 = 0.20, 0.6 x 0.2 = 0.12: the third voice is the quiet one.
+        assert_eq!(engine.steal_candidate(), Some(2));
+    }
+
+    /// A stolen voice is faded out, not switched off: the step would be a click, and the new note
+    /// has to start while the old one is still finishing.
+    #[test]
+    fn a_stolen_voice_fades_out_instead_of_stopping() {
+        let mut engine = Engine::default();
+        engine.set_sample_rate(48_000.0);
+        for index in 0..POLYPHONY {
+            let mut voice = Voice::default();
+            voice.active = true;
+            voice.note = 60;
+            voice.env.stage = EnvelopeStage::Sustain;
+            voice.env.level = 0.5;
+            // Different levels, so the victim is a decision and not a tie.
+            voice.base_gain = 0.1 + index as f32 / 1000.0;
+            voice.end_frame = 1_000_000.0;
+            voice.age = index as u64;
+            engine.voices[index] = voice;
+        }
+
+        let mut incoming = Voice::default();
+        incoming.active = true;
+        incoming.note = 99;
+        incoming.env.stage = EnvelopeStage::Sustain;
+        incoming.env.level = 1.0;
+        incoming.end_frame = 1_000_000.0;
+        engine.start_voice(incoming);
+
+        let victim = engine
+            .voices
+            .iter()
+            .enumerate()
+            .find(|(_, voice)| voice.fade_step > 0.0)
+            .expect("the quietest voice should be fading");
+        assert_eq!(victim.0, 0, "the quietest voice loses its slot");
+        assert!(
+            engine
+                .voices
+                .iter()
+                .any(|voice| voice.active && voice.note == 99),
+            "the new note must have a slot"
+        );
+        assert_eq!(
+            engine
+                .voices
+                .iter()
+                .filter(|voice| voice.active && voice.fade_step == 0.0)
+                .count(),
+            POLYPHONY,
+            "the new voice takes over the stolen voice's place in the polyphony"
+        );
+
+        let mut faded = false;
+        for _ in 0..(STEAL_FADE_MS * 2.0 * 48.0) as usize {
+            engine.render_sample();
+            if !engine
+                .voices
+                .iter()
+                .any(|voice| voice.active && voice.fade_step > 0.0)
+            {
+                faded = true;
+                break;
+            }
+        }
+        assert!(faded, "a stolen voice must finish fading and free its slot");
+    }
+
+    /// A one-shot envelope decays to a zero sustain and stays there. Holding that slot is what
+    /// starves the pool on a piano, where every note is a one-shot.
+    #[test]
+    fn a_decayed_one_shot_gives_up_its_slot() {
+        let mut engine = Engine::default();
+        engine.set_sample_rate(48_000.0);
+        let mut voice = Voice::default();
+        voice.active = true;
+        voice.note = 60;
+        voice.env = Envelope::new(
+            Ahdsr {
+                attack_curve: 0.0,
+                attack_ms: 0.0,
+                decay_ms: 1.0,
+                hold_ms: 0.0,
+                release_ms: 100.0,
+                sustain: 0.0,
+            },
+            48_000.0,
+        );
+        voice.end_frame = 1_000_000.0;
+        engine.voices[0] = voice;
+
+        for _ in 0..500 {
+            engine.render_sample();
+        }
+        assert!(
+            !engine.voices[0].active,
+            "a silent held voice must not keep a slot"
+        );
     }
 
     #[test]

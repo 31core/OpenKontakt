@@ -162,7 +162,9 @@ pub fn render(
                     } else {
                         engine.note_on_blocking(key, velocity as f32 / 127.0);
                     }
-                    if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() {
+                    // The full voice list is a line per voice per note, which buries everything
+                    // else the render says. It gets its own switch.
+                    if std::env::var("OPENKONTAKT_VOICE_DEBUG").is_ok() {
                         eprintln!(
                             "debug: note {key} vel {velocity} -> {:?}",
                             engine.debug_voices()
@@ -185,7 +187,7 @@ pub fn render(
                 | Message::ChannelPressure { .. } => {}
             }
         }
-        if std::env::var("OPENKONTAKT_RENDER_DEBUG").is_ok() && frame % 24_000 == 0 && frame > 0 {
+        if std::env::var("OPENKONTAKT_VOICE_DEBUG").is_ok() && frame % 24_000 == 0 && frame > 0 {
             eprintln!(
                 "debug: t={:.2}s voices {:?}",
                 frame as f32 / sample_rate,
