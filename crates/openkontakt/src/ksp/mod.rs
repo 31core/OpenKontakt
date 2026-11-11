@@ -295,6 +295,14 @@ pub trait Host {
     fn skin_offset(&mut self, _offset: f32) {}
     /// `set_key_color`: recolour one key of the instrument's keyboard.
     fn set_key_color(&mut self, _note: i64, _colour: i64) {}
+    /// `set_controller`: write a MIDI controller value into the shared `%CC` table.
+    fn set_controller(&mut self, _number: i64, _value: i64) {}
+    /// Host tempo, for `ms_to_ticks` and the listener timer.
+    fn tempo_bpm(&self) -> f64 {
+        DEFAULT_TEMPO_BPM
+    }
+    /// `change_listener_par($NI_SIGNAL_TIMER_MS, ms)`: how often this slot's `on listener` runs.
+    fn set_listener_period(&mut self, _milliseconds: f64) {}
     fn load_ir_sample(&mut self, _path: &str, _slot: i64, _generic: i64) -> bool {
         false
     }
@@ -394,6 +402,17 @@ pub struct EngineState {
     /// Keyboard swatches, shared by every slot the way `set_key_color` is shared in KONTAKT:
     /// whichever script runs last decides what the key looks like.
     key_colors: Mutex<KeyColours>,
+    /// Built-in `%CC[128]`. The host's MIDI input writes it, and so does a script's
+    /// `set_controller`: panels use controller numbers as a bus between their slots.
+    cc: Mutex<[i64; 128]>,
+    /// Which controllers a *script* has written. A panel that drives a parameter from its own
+    /// timer is the only case where the player knows what a controller means, so the engine keys
+    /// its voice filter on this rather than on the host's MIDI input.
+    script_controllers: Mutex<[bool; 128]>,
+    /// Host tempo, which `ms_to_ticks` and every listener timer are expressed against.
+    tempo_bpm: Mutex<f64>,
+    /// `change_listener_par($NI_SIGNAL_TIMER_MS, …)` per slot, in milliseconds.
+    listener_period_ms: Mutex<HashMap<usize, f64>>,
 }
 
 impl Default for EngineState {
@@ -410,6 +429,10 @@ impl Default for EngineState {
             panel_heights: Mutex::new(HashMap::new()),
             skin_offsets: Mutex::new(HashMap::new()),
             key_colors: Mutex::new([None; 128]),
+            cc: Mutex::new([0; 128]),
+            script_controllers: Mutex::new([false; 128]),
+            tempo_bpm: Mutex::new(DEFAULT_TEMPO_BPM),
+            listener_period_ms: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -455,6 +478,78 @@ impl EngineState {
             .lock()
             .ok()
             .and_then(|value| value.clone())
+    }
+
+    /// One MIDI controller value, as a script or the host last set it.
+    pub fn controller(&self, number: usize) -> i64 {
+        self.cc
+            .lock()
+            .ok()
+            .and_then(|values| values.get(number).copied())
+            .unwrap_or(0)
+    }
+
+    fn set_controller(&self, number: i64, value: i64) {
+        if (0..128).contains(&number) {
+            if let Ok(mut values) = self.cc.lock() {
+                values[number as usize] = value;
+            }
+        }
+    }
+
+    /// `set_controller` called by a script, which also records that the script owns this
+    /// controller.
+    fn set_controller_from_script(&self, number: i64, value: i64) {
+        self.set_controller(number, value);
+        if (0..128).contains(&number) {
+            if let Ok(mut written) = self.script_controllers.lock() {
+                written[number as usize] = true;
+            }
+        }
+    }
+
+    /// Has a script written this controller? Only then does the player know what it controls.
+    pub fn script_wrote_controller(&self, number: usize) -> bool {
+        self.script_controllers
+            .lock()
+            .ok()
+            .and_then(|written| written.get(number).copied())
+            .unwrap_or(false)
+    }
+
+    fn controllers(&self) -> Vec<Value> {
+        self.cc
+            .lock()
+            .map(|values| values.iter().map(|value| Value::Int(*value)).collect())
+            .unwrap_or_else(|_| vec![Value::Int(0); 128])
+    }
+
+    /// Host tempo in BPM. 120 until the host reports one.
+    pub fn tempo_bpm(&self) -> f64 {
+        self.tempo_bpm
+            .lock()
+            .map(|tempo| *tempo)
+            .unwrap_or(DEFAULT_TEMPO_BPM)
+    }
+
+    pub fn set_tempo_bpm(&self, tempo: f64) {
+        if let Ok(mut current) = self.tempo_bpm.lock() {
+            *current = tempo.clamp(1.0, 1000.0);
+        }
+    }
+
+    /// The interval a slot asked for with `change_listener_par`, if it asked at all.
+    pub fn listener_period(&self, slot: usize) -> Option<f64> {
+        self.listener_period_ms
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&slot).copied())
+    }
+
+    fn set_listener_period(&self, slot: usize, milliseconds: f64) {
+        if let Ok(mut map) = self.listener_period_ms.lock() {
+            map.insert(slot, milliseconds.clamp(1.0, 10_000.0));
+        }
     }
 
     /// Panel height a script asked for with `set_ui_height_px`.
@@ -567,6 +662,18 @@ pub struct EngineHost {
 }
 
 impl Host for EngineHost {
+    fn set_controller(&mut self, number: i64, value: i64) {
+        self.state.set_controller_from_script(number, value);
+    }
+
+    fn tempo_bpm(&self) -> f64 {
+        self.state.tempo_bpm()
+    }
+
+    fn set_listener_period(&mut self, milliseconds: f64) {
+        self.state.set_listener_period(self.slot, milliseconds);
+    }
+
     fn engine_par(&mut self, param: &str, group: i64, slot: i64, generic: i64) -> Option<i64> {
         if let Some(value) = self.state.get_cached(param, group, slot, generic) {
             return Some(value);
@@ -1362,6 +1469,34 @@ impl<'a> Interp<'a> {
                 self.host.note_off_event(id);
                 Ok(Value::Int(0))
             }
+            // A script writing a controller value is indistinguishable from an incoming CC to
+            // everything else: it lands in the shared table, so another slot — and the engine —
+            // sees what an external controller would have set.
+            "set_controller" => {
+                let number = self.eval_arg(args, 0)?;
+                let value = self.eval_arg(args, 1)?;
+                self.host.set_controller(number, value);
+                if (0..128).contains(&number) {
+                    self.vars
+                        .set_index("%CC", number, Value::Int(value.clamp(0, 127)));
+                }
+                Ok(Value::Int(0))
+            }
+            "change_listener_par" => {
+                // Only `$NI_SIGNAL_TIMER_MS` is honoured; a beat clock would need the host
+                // transport, which a player driven by a note stream does not have.
+                let _signal = self.eval_arg(args, 0)?;
+                let value = self.eval_arg(args, 1)?;
+                self.host.set_listener_period(value as f64);
+                Ok(Value::Int(0))
+            }
+            "ms_to_ticks" => {
+                let milliseconds = self.eval_arg(args, 0)? as f64;
+                let ms_per_quarter = 60_000.0 / self.host.tempo_bpm().max(1.0);
+                Ok(Value::Int(
+                    (milliseconds / ms_per_quarter * TICKS_PER_QUARTER).round() as i64,
+                ))
+            }
             "change_note" => {
                 let id = self.eval_arg(args, 0)?;
                 let note = self.eval_arg(args, 1)?;
@@ -1628,6 +1763,23 @@ pub const INST_ICON_ID: i64 = INST_ID_BASE + 1;
 /// Bit in `$CONTROL_PAR_HIDE` that removes a control from the panel entirely.
 pub const HIDE_WHOLE_CONTROL: i64 = 16;
 
+/// KONTAKT's internal resolution, in ticks per quarter note, as `ms_to_ticks` counts them.
+///
+/// A timer script divides `ms_to_ticks(…)` by 960 and then inverts the result to get a period in
+/// milliseconds, so the constant only becomes visible through the rate those panels actually run
+/// at. It falls out exactly: the script's `60000000 / $Tempo` arithmetic lands on
+/// `640 * ms_per_quarter / ticks`, and one library's panel takes eight seconds for its 32 steps at
+/// 120 BPM — 250 ms per step, which is an eighth note, and 250 ms is what 1280 ticks gives. With
+/// 960 the same table takes 10.7 s and with 2880 it takes 3.6 s.
+pub const TICKS_PER_QUARTER: f64 = 1280.0;
+
+/// Tempo assumed before the host reports one.
+pub const DEFAULT_TEMPO_BPM: f64 = 120.0;
+
+/// How often `on listener` runs before the script has asked for its own interval. Timer scripts
+/// set one on their first tick; one that never asks keeps this. [open]
+pub const DEFAULT_LISTENER_MS: f64 = 10.0;
+
 /// `set_key_color` swatches, in KONTAKT's own order: `$KEY_COLOR_DEFAULT` is 0 and every later
 /// name is one higher. The order is the order the constants are listed in NI's reference; the
 /// names are what scripts pass, so this table is also how `$KEY_COLOR_*` is resolved.
@@ -1716,6 +1868,8 @@ fn symbol(name: &str) -> Option<Value> {
         "EVENT_PAR_TUNE" => 2,
         "EVENT_PAR_POSITION" => 3,
         "ALL_GROUPS" => -1,
+        "NI_SIGNAL_TIMER_MS" => 0,
+        "NI_SIGNAL_TIMER_BEAT" => 1,
         "EVENT_STATUS_INACTIVE" => 0,
         "EVENT_STATUS_ACTIVE" => 1,
         "EVENT_STATUS_STOLEN" => 2,
@@ -1759,8 +1913,6 @@ pub struct KspRuntime {
     pub engine: Arc<EngineState>,
     root: String,
     groups: Arc<Vec<GroupInfo>>,
-    /// Built-in `%CC[128]`, shared by every slot and fed by the host's MIDI input.
-    cc: Mutex<[i64; 128]>,
 }
 
 impl KspRuntime {
@@ -1793,7 +1945,6 @@ impl KspRuntime {
             engine: Arc::new(EngineState::default()),
             root: root.to_string(),
             groups: Arc::new(groups),
-            cc: Mutex::new([0; 128]),
         }
     }
 
@@ -1988,10 +2139,7 @@ impl KspRuntime {
     }
 
     fn cc_snapshot(&self) -> Vec<Value> {
-        self.cc
-            .lock()
-            .map(|values| values.iter().map(|value| Value::Int(*value)).collect())
-            .unwrap_or_else(|_| vec![Value::Int(0); 128])
+        self.engine.controllers()
     }
 
     fn install_builtins(&self, interp: &mut Interp<'_>) {
@@ -2003,12 +2151,100 @@ impl KspRuntime {
 
     /// Feed a MIDI controller event to the scripts.
     pub fn controller(&self, number: i64, value: i64) -> Dispatch {
-        if (0..128).contains(&number) {
-            if let Ok(mut cc) = self.cc.lock() {
-                cc[number as usize] = value;
+        self.engine.set_controller(number, value);
+        self.dispatch_with("controller", EventContext::default(), Some((number, value)))
+    }
+
+    /// Run one slot's `on listener` callbacks.
+    ///
+    /// Each script has its own listener timer, so unlike `dispatch` this reaches exactly one slot.
+    /// `None` means the slot has no listener at all, which is what lets the engine skip it.
+    pub fn listener(&self, index: usize) -> Option<Dispatch> {
+        let mut result = Dispatch::default();
+        {
+            let mut state = self.slots.get(index)?.lock().ok()?;
+            let program = state.program.clone()?;
+            if !state.initialized {
+                return None;
+            }
+            let callbacks: Vec<Callback> = program
+                .callbacks
+                .iter()
+                .filter(|callback| callback.kind == "listener")
+                .cloned()
+                .collect();
+            if callbacks.is_empty() {
+                return None;
+            }
+            let mut host = EngineHost {
+                slot: index,
+                state: Arc::clone(&self.engine),
+                root: self.root.clone(),
+                groups: Arc::clone(&self.groups),
+                allowed: None,
+                actions: Vec::new(),
+                ignored: false,
+                pgs_changed: Vec::new(),
+            };
+            let mut interp = Interp::new(&program, &mut host);
+            interp.vars = std::mem::take(&mut state.vars);
+            interp.ui = std::mem::take(&mut state.ui);
+            self.install_builtins(&mut interp);
+            for callback in &callbacks {
+                interp.steps = 0;
+                if let Err(error) = interp.run(&callback.body) {
+                    state.diagnostics.push(format!("KSP on listener: {error}"));
+                    break;
+                }
+            }
+            state.vars = interp.vars;
+            state.ui = interp.ui;
+            result.allowed_groups = host.allowed.take();
+            result.actions = std::mem::take(&mut host.actions);
+            result.ignore_event = host.ignored;
+            result.pgs_changed = std::mem::take(&mut host.pgs_changed);
+        }
+        // Outside the lock: a pgs write wakes the other scripts, this one included.
+        if !result.pgs_changed.is_empty() {
+            let changed = std::mem::take(&mut result.pgs_changed);
+            for key in changed {
+                self.dispatch_pgs_changed(&key, 0, &mut result);
             }
         }
-        self.dispatch_with("controller", EventContext::default(), Some((number, value)))
+        Some(result)
+    }
+
+    /// One script variable, for diagnostics. `$` or `%` is optional; an array reads element zero.
+    pub fn variable(&self, index: usize, name: &str) -> Option<i64> {
+        let state = self.slots.get(index)?.lock().ok()?;
+        Some(state.vars.get(bare(name)).as_int())
+    }
+
+    /// How often a slot's `on listener` should run: the interval the script asked for, or the
+    /// default while it has not asked yet — the timer sets its own interval from inside the
+    /// callback, so the first tick cannot wait for it.
+    pub fn listener_period_ms(&self, index: usize) -> Option<f64> {
+        if let Some(period) = self.engine.listener_period(index) {
+            return Some(period);
+        }
+        let has_listener = self
+            .slots
+            .get(index)
+            .and_then(|slot| slot.lock().ok())
+            .map(|state| {
+                state
+                    .program
+                    .as_ref()
+                    .map(|program| {
+                        program
+                            .callbacks
+                            .iter()
+                            .any(|callback| callback.kind == "listener")
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        has_listener.then_some(DEFAULT_LISTENER_MS)
     }
 
     /// Run `on note` or `on release` for every slot and collect what the scripts asked for.
@@ -2493,7 +2729,10 @@ mod tests {
         );
         let controls = runtime.controls(0);
         let first = controls.iter().find(|c| c.name == "First").unwrap();
-        assert_eq!(first.value, 1, "the saved selection must survive the restore");
+        assert_eq!(
+            first.value, 1,
+            "the saved selection must survive the restore"
+        );
     }
 
     #[test]
@@ -2708,6 +2947,100 @@ mod tests {
     }
 
     #[test]
+    /// A panel's LFO is an `on listener` callback: the playhead is a control the script moves from
+    /// there, and the interval is asked for from inside that same callback. Without a clock the
+    /// playhead never leaves step 1 and the panel looks frozen.
+    #[test]
+    fn a_listener_runs_on_its_own_clock() {
+        let text = r#"
+        on init
+          declare $count
+          declare ui_slider $pos(0, 31)
+        end on
+        on listener
+          inc($count)
+          $pos := $count
+          change_listener_par($NI_SIGNAL_TIMER_MS, 250)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        assert_eq!(
+            runtime.listener_period_ms(0),
+            Some(DEFAULT_LISTENER_MS),
+            "a slot with a listener ticks before it has asked for a period"
+        );
+        runtime.listener(0);
+        runtime.listener(0);
+        let controls = runtime.controls(0);
+        let pos = controls
+            .iter()
+            .find(|control| control.name == "pos")
+            .unwrap();
+        assert_eq!(pos.value, 2, "the playhead advances once per listener tick");
+        assert_eq!(runtime.listener_period_ms(0), Some(250.0));
+    }
+
+    /// A slot without a listener has no clock at all, so the engine can skip it.
+    #[test]
+    fn only_a_slot_with_a_listener_gets_a_clock() {
+        let text = r#"
+        on init
+          declare $x
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        assert_eq!(runtime.listener_period_ms(0), None);
+    }
+
+    /// `ms_to_ticks` is what a timer script divides by to turn a tempo into a step length. The
+    /// tick rate is pinned by the rate those panels run at (see `TICKS_PER_QUARTER`).
+    #[test]
+    fn ms_to_ticks_uses_the_host_tempo() {
+        let text = r#"
+        on init
+          declare ui_slider $ticks(0, 100000)
+          $ticks := ms_to_ticks(500)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        // One quarter note at 120 BPM is 1280 ticks.
+        assert_eq!(runtime.controls(0)[0].value, 1280);
+
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.engine.set_tempo_bpm(60.0);
+        runtime.initialize();
+        assert_eq!(runtime.controls(0)[0].value, 640);
+    }
+
+    /// A script's `set_controller` is how one panel slot hands a value to another: the LFO slot
+    /// writes CC 76 and the other slots read `%CC[76]`. It has to be one shared table.
+    #[test]
+    fn a_script_can_write_a_controller_another_slot_reads() {
+        let writer = r#"
+        on listener
+          set_controller(76, 99)
+        end on
+        "#;
+        let reader = r#"
+        on init
+          declare ui_slider $seen(0, 127)
+        end on
+        on listener
+          $seen := %CC[76]
+        end on
+        "#;
+        let runtime =
+            KspRuntime::compile(&[Some(writer.to_string()), Some(reader.to_string())], "");
+        runtime.initialize();
+        runtime.listener(0);
+        assert_eq!(runtime.engine.controller(76), 99);
+        runtime.listener(1);
+        assert_eq!(runtime.controls(1)[0].value, 99);
+    }
+
     fn controller_reaches_the_script_through_cc_array() {
         let text = r#"
         on init

@@ -21,7 +21,7 @@ fn main() {
     let Some(path) = args.next() else {
         eprintln!(
             "usage: ok-inspect <instrument.nki> [--samples] [--zones] [--scripts] [--persistent] \
-             [--keys] [--dump]"
+             [--keys] [--dump] [--press NAME] [--note KEY] [--listener N] [--var NAME]"
         );
         std::process::exit(2);
     };
@@ -150,7 +150,7 @@ fn main() {
                         let head: Vec<String> = entry
                             .values
                             .iter()
-                            .take(6)
+                            .take(40)
                             .map(|value| value.to_string())
                             .collect();
                         println!(
@@ -159,7 +159,7 @@ fn main() {
                             entry.name,
                             entry.values.len(),
                             head.join(" "),
-                            if entry.values.len() > 6 { " ..." } else { "" }
+                            if entry.values.len() > 40 { " ..." } else { "" }
                         );
                     }
                 }
@@ -295,7 +295,51 @@ fn main() {
                         println!("  pressed {name}: {pressed}");
                     }
                 }
+                // `--note KEY` feeds a note-on: a panel's listener usually only steps while a key
+                // is held, because the scripts gate the LFO on `$keys_down`.
+                if let Some(position) = std::env::args().position(|arg| arg == "--note") {
+                    let key: i64 = std::env::args()
+                        .nth(position + 1)
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(60);
+                    runtime.dispatch(
+                        "note",
+                        openkontakt::ksp::EventContext {
+                            note: key,
+                            velocity: 100,
+                            id: 1,
+                            status: 1,
+                        },
+                    );
+                }
+                // `--listener N` runs N listener ticks, which is what the audio engine's timer
+                // does while the host is playing.
+                if let Some(position) = std::env::args().position(|arg| arg == "--listener") {
+                    let ticks: usize = std::env::args()
+                        .nth(position + 1)
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(1);
+                    for slot in 0..runtime.slot_count() {
+                        for _ in 0..ticks {
+                            runtime.listener(slot);
+                        }
+                    }
+                }
+                // `--var NAME` prints one script variable per slot; a panel's state machine is
+                // unreadable from the controls alone.
+                if let Some(position) = std::env::args().position(|arg| arg == "--var") {
+                    if let Some(name) = std::env::args().nth(position + 1) {
+                        for slot in 0..runtime.slot_count() {
+                            if let Some(value) = runtime.variable(slot, &name) {
+                                println!("  slot {slot} {name} = {value}");
+                            }
+                        }
+                    }
+                }
                 for slot in 0..runtime.slot_count() {
+                    if let Some(period) = runtime.listener_period_ms(slot) {
+                        println!("  slot {slot} listener every {period} ms");
+                    }
                     for control in runtime.controls(slot) {
                         // A table is bound to an array, so say what it currently holds; an empty
                         // one draws no bars and looks like a broken panel.
@@ -348,6 +392,66 @@ fn main() {
                                 hex.join(" ")
                             );
                         }
+                    }
+                }
+            }
+            if std::env::args().any(|arg| arg == "--trailer") {
+                let wanted: usize = std::env::args()
+                    .nth(
+                        std::env::args()
+                            .position(|arg| arg == "--trailer")
+                            .unwrap_or(0)
+                            + 1,
+                    )
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                for group in &instrument.groups {
+                    if group.index != wanted {
+                        continue;
+                    }
+                    let start = group.private.len().saturating_sub(206);
+                    let body = &group.private[start..];
+                    for (line, chunk) in body.chunks(16).enumerate() {
+                        let text: String = chunk
+                            .iter()
+                            .map(|b| if (32..127).contains(b) { *b as char } else { '.' })
+                            .collect();
+                        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+                        println!(
+                            "  {:4}  {:<47} {text}",
+                            line * 16,
+                            hex.join(" ")
+                        );
+                    }
+                }
+            }
+            if std::env::args().any(|arg| arg == "--racks") {
+                for group in &instrument.groups {
+                    let Some(rack) = openkontakt::effects::group_rack(&group.private) else {
+                        continue;
+                    };
+                    let used: Vec<String> = rack
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, slot)| {
+                            let slot = slot.as_ref()?;
+                            Some(format!(
+                                "{index}:0x{:02X}{}{}",
+                                slot.module,
+                                if slot.bypass { "(bypassed)" } else { "" },
+                                match openkontakt::effects::decode(slot) {
+                                    openkontakt::effects::ModuleParams::Filter {
+                                        cutoff,
+                                        resonance,
+                                    } => format!(" cutoff={cutoff:.4} res={resonance:.4}"),
+                                    _ => String::new(),
+                                }
+                            ))
+                        })
+                        .collect();
+                    if !used.is_empty() {
+                        println!("  group {} rack: {}", group.index, used.join(" "));
                     }
                 }
             }

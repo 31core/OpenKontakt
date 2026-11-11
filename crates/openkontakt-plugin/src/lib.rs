@@ -175,6 +175,13 @@ impl Plugin for OpenKontakt {
 
         let block_started = std::time::Instant::now();
         let loaded = self.shared.current();
+        // Listener timers and `ms_to_ticks` follow the host tempo, as KONTAKT's do; without it a
+        // tempo-synced LFO would run at a fixed 120 BPM whatever the project is set to.
+        if let Some(tempo) = context.transport().tempo {
+            if let Some(loaded) = &loaded {
+                loaded.ksp.engine.set_tempo_bpm(tempo);
+            }
+        }
         self.engine.set_instrument(loaded);
         // Global Tune is stored in cents relative to A440; the engine wants semitones.
         self.engine

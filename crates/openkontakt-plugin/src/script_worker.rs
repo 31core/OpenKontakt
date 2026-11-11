@@ -34,6 +34,10 @@ pub enum ScriptCommand {
         number: i64,
         value: i64,
     },
+    /// One script's `on listener` timer came due.
+    Listener {
+        slot: usize,
+    },
 }
 
 pub struct ScriptResult {
@@ -115,6 +119,7 @@ fn dispatch(runtime: &KspRuntime, command: ScriptCommand) -> Dispatch {
             },
         ),
         ScriptCommand::Controller { number, value } => runtime.controller(number, value),
+        ScriptCommand::Listener { slot } => runtime.listener(slot).unwrap_or_default(),
     }
 }
 

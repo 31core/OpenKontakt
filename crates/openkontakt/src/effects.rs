@@ -234,6 +234,7 @@ pub fn parse_rack(body: &[u8]) -> Result<Rack> {
         RackFraming::CountThenPresence,
         RackFraming::EightPresence,
         RackFraming::PresenceChunkPairs,
+        RackFraming::PresencePerSlot,
         RackFraming::ChunksOnly,
     ] {
         if let Ok(slots) = try_rack(public, object.version, variant) {
@@ -256,6 +257,7 @@ enum RackFraming {
     CountThenPresence,
     EightPresence,
     PresenceChunkPairs,
+    PresencePerSlot,
     ChunksOnly,
 }
 
@@ -315,6 +317,26 @@ fn try_rack(public: &[u8], version: u16, framing: RackFraming) -> Result<Vec<Opt
                 }
                 index += 1;
             }
+        }
+        RackFraming::PresencePerSlot => {
+            // One presence byte per slot, always eight of them, and then a trailer that belongs to
+            // the rack rather than to a slot (a group's rack carries it; the program's does not).
+            for slot in slots.iter_mut() {
+                let flag = reader.u8()?;
+                if flag == 0 {
+                    continue;
+                }
+                let Some((id, body)) = read_chunk_body(&mut reader)? else {
+                    return Err(Error::malformed("FX rack", 0, "missing slot chunk"));
+                };
+                if id != 0x25 {
+                    return Err(Error::malformed("FX rack", 0, "unexpected slot chunk"));
+                }
+                *slot = Some(parse_slot(body)?);
+            }
+            // Not a slot: the group rack's trailer. Consume it so the framing fits exactly.
+            let rest = reader.remaining();
+            reader.take(rest)?;
         }
         RackFraming::ChunksOnly => {
             let mut index = 0;
@@ -521,6 +543,33 @@ pub fn group_rack(private: &[u8]) -> Option<Rack> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group's rack is eight presence bytes with a slot chunk after a `1`, and then a trailer
+    /// that belongs to the rack rather than to a slot. The known framings rejected the whole body
+    /// because of that trailer, which left every group's insert chain — including its filter —
+    /// unreadable.
+    #[test]
+    fn a_group_rack_tolerates_its_trailer() {
+        // One slot, taken from a two-microphone piano: slot object, 22-byte private block, empty
+        // public section, and a single child module (0x18, the filter).
+        let slot: Vec<u8> = vec![
+            0x01, 0x50, 0x00, 0x16, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x18, 0x00, 0x17, 0x00, 0x00,
+            0x00, 0x00, 0x92, 0x00, 0x16, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0xcd,
+            0x15, 0x46, 0x00, 0x00, 0x15, 0x40, 0x00, 0x00, 0x40, 0xc0,
+        ];
+        let mut body = vec![0x00, 0x12, 0x00, 0x01, 0x25, 0x00];
+        body.extend_from_slice(&(slot.len() as u32).to_le_bytes());
+        body.extend_from_slice(&slot);
+        body.extend_from_slice(&[0u8; 7]); // the other seven slots are empty
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // the rack's own trailer
+
+        let rack = parse_rack(&body).expect("the framing should fit");
+        let slot = rack.slot(0).expect("slot 0 holds a module");
+        assert_eq!(slot.module, 0x18);
+        assert_eq!(slot.params.len(), 20);
+    }
 
     #[test]
     fn gainer_module_decodes() {

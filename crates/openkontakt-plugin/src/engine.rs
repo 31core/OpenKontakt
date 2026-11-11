@@ -2,7 +2,7 @@ use crate::fx;
 use crate::script_worker::{IrLoader, ScriptCommand, ScriptWorker};
 use crate::state::LoadedInstrument;
 use openkontakt::Instrument;
-use openkontakt::dsp::Convolver;
+use openkontakt::dsp::{Biquad, Convolver};
 use openkontakt::effects::{self, ModuleParams};
 use openkontakt::envelope::{self, Ahdsr};
 use openkontakt::ksp::EventContext;
@@ -154,6 +154,10 @@ struct Voice {
     gain_right: f32,
     base_gain: f32,
     env: Envelope,
+    /// The voice's own low-pass, when the instrument's panel drives a cutoff. Every voice needs
+    /// its own coefficients and state: the panel sweeps the cutoff per note, and one shared filter
+    /// would smear a sweep across voices.
+    filter: Option<Biquad>,
     age: u64,
     /// Fade applied when the voice has been stolen: `fade_gain` falls to zero at `fade_step` per
     /// sample. `fade_step == 0` means the voice is not being stolen.
@@ -193,6 +197,7 @@ impl Default for Voice {
                 release_step: 0.0,
                 release_left: 0.0,
             },
+            filter: None,
             age: 0,
             fade_gain: 1.0,
             fade_step: 0.0,
@@ -255,6 +260,12 @@ pub struct Engine {
     send_levels: [f32; 8],
     /// KSP interpreter thread; the audio callback only posts commands and applies results.
     script: Option<ScriptWorker>,
+    /// Controller value the sounding voices' filters were last tuned to.
+    voice_controller: Option<i64>,
+    /// Samples rendered so far: the clock the listener timers run on.
+    samples_rendered: u64,
+    /// When each slot's `on listener` is next due, in seconds.
+    listener_next: Vec<f64>,
     /// Impulse-response loader thread.
     ir: Option<IrLoader>,
     pub peak_left: f32,
@@ -296,6 +307,9 @@ impl Default for Engine {
             send_levels: [0.0; 8],
             script: None,
             ir: None,
+            voice_controller: None,
+            samples_rendered: 0,
+            listener_next: Vec::new(),
             peak_left: 0.0,
             peak_right: 0.0,
         }
@@ -313,6 +327,8 @@ impl Engine {
             voice.env.stage = EnvelopeStage::Off;
         }
         self.current = None;
+        self.samples_rendered = 0;
+        self.listener_next.clear();
         self.peak_left = 0.0;
         self.peak_right = 0.0;
     }
@@ -325,6 +341,8 @@ impl Engine {
         };
         if changed {
             self.current = instrument.clone();
+            // A new instrument brings new listener timers; the old schedule must not carry over.
+            self.listener_next.clear();
             for voice in &mut self.voices {
                 voice.active = false;
                 voice.env.stage = EnvelopeStage::Off;
@@ -426,6 +444,98 @@ impl Engine {
         }
     }
 
+    /// The controller a panel drives a voice's cutoff with.
+    const VOICE_CUTOFF_CONTROLLER: usize = 76;
+    /// Resonance of that filter, from the group module the panel's cutoff belongs to. Mild enough
+    /// that it does not colour the sweep, which is what the reference's spectra show.
+    const VOICE_CUTOFF_RESONANCE: f32 = 0.1;
+
+    /// A fresh filter for a new voice, when the instrument's panel drives one.
+    ///
+    /// The gate is "a script wrote this controller": a controller the host sent may mean anything,
+    /// and only a panel that computes its own value tells the player what it controls.
+    fn voice_filter(&self) -> Option<Biquad> {
+        let loaded = self.current.as_ref()?;
+        if !loaded
+            .ksp
+            .engine
+            .script_wrote_controller(Self::VOICE_CUTOFF_CONTROLLER)
+        {
+            return None;
+        }
+        let cutoff = openkontakt::dsp::voice_filter::cutoff_hz(
+            loaded.ksp.engine.controller(Self::VOICE_CUTOFF_CONTROLLER),
+        );
+        Some(Biquad::low_pass(
+            self.sample_rate,
+            cutoff,
+            Self::VOICE_CUTOFF_RESONANCE,
+        ))
+    }
+
+    /// Retune the sounding voices when the panel moved the controller.
+    fn sync_voice_filter(&mut self) {
+        let loaded = self.current.clone();
+        let Some(loaded) = loaded else {
+            return;
+        };
+        if !loaded
+            .ksp
+            .engine
+            .script_wrote_controller(Self::VOICE_CUTOFF_CONTROLLER)
+        {
+            return;
+        }
+        let controller = loaded.ksp.engine.controller(Self::VOICE_CUTOFF_CONTROLLER);
+        if self.voice_controller == Some(controller) {
+            return;
+        }
+        self.voice_controller = Some(controller);
+        let cutoff = openkontakt::dsp::voice_filter::cutoff_hz(controller);
+        for voice in &mut self.voices {
+            if !voice.active {
+                continue;
+            }
+            if let Some(filter) = voice.filter.as_mut() {
+                filter.set_cutoff(cutoff);
+            }
+        }
+    }
+
+    /// Run the scripts' `on listener` timers.
+    ///
+    /// A panel's LFO, arpeggiator and step display live in that callback: the script asks for an
+    /// interval with `change_listener_par($NI_SIGNAL_TIMER_MS, …)` and moves its playhead from
+    /// there. Nothing else calls it, so without this such a panel sits frozen on its first step.
+    fn tick_listeners(&mut self) {
+        let Some(loaded) = self.current.clone() else {
+            return;
+        };
+        let now = self.samples_rendered as f64 / self.sample_rate.max(1.0) as f64;
+        let slots = loaded.ksp.slot_count();
+        if self.listener_next.len() < slots {
+            self.listener_next.resize(slots, 0.0);
+        }
+        for slot in 0..slots {
+            let Some(period_ms) = loaded.ksp.listener_period_ms(slot) else {
+                continue;
+            };
+            if now < self.listener_next[slot] {
+                continue;
+            }
+            let period = (period_ms / 1000.0).max(0.001);
+            // Advance on a grid: a 1 s LFO ticks once a second, not once a second plus a block.
+            let next = self.listener_next[slot] + period;
+            self.listener_next[slot] = if next > now { next } else { now + period };
+            if let Some(worker) = self.script.as_mut() {
+                worker.submit(ScriptCommand::Listener { slot });
+            } else if let Some(dispatch) = loaded.ksp.listener(slot) {
+                let allowed = dispatch.allowed_groups.clone();
+                self.execute_actions(&dispatch.actions, allowed.as_deref());
+            }
+        }
+    }
+
     /// Retune the master filter from the script's current values (0..1 knobs).
     fn sync_filter(&mut self) {
         let Some(loaded) = self.current.clone() else {
@@ -465,6 +575,8 @@ impl Engine {
     /// settings, and loads an impulse response the first time a script asks for it.
     pub fn prepare_block(&mut self) {
         self.sync_filter();
+        self.sync_voice_filter();
+        self.tick_listeners();
         // A script toggling an effect bypass has to be picked up while notes are sounding.
         if let Some(loaded) = self.current.as_ref() {
             let mut changed = false;
@@ -642,7 +754,7 @@ impl Engine {
                     self.trigger_phase(key, velocity, allowed.as_deref(), TriggerPhase::NoteOff);
                     self.execute_actions(&result.dispatch.actions, allowed.as_deref());
                 }
-                ScriptCommand::Controller { .. } => {
+                ScriptCommand::Controller { .. } | ScriptCommand::Listener { .. } => {
                     self.execute_actions(
                         &result.dispatch.actions,
                         result.dispatch.allowed_groups.as_deref(),
@@ -1082,6 +1194,7 @@ impl Engine {
             let reverse = group.reverse;
             let event_id = self.event_ids[event_key as usize & 127];
             let envelope = self.voice_envelope(zone.group_index);
+            let filter = self.voice_filter();
 
             started += 1;
             self.start_voice(Voice {
@@ -1103,6 +1216,7 @@ impl Engine {
                 gain_right,
                 base_gain,
                 env: Envelope::new(envelope, self.sample_rate),
+                filter,
                 age: 0,
                 fade_gain: 1.0,
                 fade_step: 0.0,
@@ -1265,6 +1379,7 @@ impl Engine {
 
     /// Render one stereo sample. Returns `(left, right)` before the master section.
     pub fn render_sample(&mut self) -> (f32, f32) {
+        self.samples_rendered = self.samples_rendered.wrapping_add(1);
         let mut left = 0.0;
         let mut right = 0.0;
         self.bus_left = [0.0; 16];
@@ -1296,7 +1411,11 @@ impl Engine {
                 continue;
             }
 
-            let (sample_left, sample_right) = voice.sample.sample_at(voice.position);
+            let (mut sample_left, mut sample_right) = voice.sample.sample_at(voice.position);
+            if let Some(filter) = voice.filter.as_mut() {
+                sample_left = filter.process(0, sample_left);
+                sample_right = filter.process(1, sample_right);
+            }
             let fade = if voice.fade_step > 0.0 {
                 let fade = voice.fade_gain;
                 voice.fade_gain -= voice.fade_step;

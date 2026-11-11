@@ -23,7 +23,8 @@ a silent or uninitialised instrument.
 * `on note` for a note-on, before the zone lookup, because the script can rewrite the note;
 * `on release` for a note-off, with the event's identity so the script can find what it started;
 * `on ui_control($x)` when a control changes, whether the user moved it or the script wrote it;
-* `on controller` for a MIDI CC.
+* `on controller` for a MIDI CC;
+* `on listener` on that script's own timer, whether or not anything else is happening.
 
 **1.4 Persistence.** A saved instrument carries the user's settings for every variable marked
 `make_persistent`, as text. They are restored **after** `on init` and before the instrument is
@@ -126,6 +127,34 @@ back. The stored form is text: a name, then the values, one entry per variable o
 `load_ir_sample()` asks for a convolution impulse, `pgs_*` is cross-script shared state, `wait()`
 suspends for a moment.
 
+**6.5 The listener clock.** A panel's LFO, arpeggiator and step display are one callback,
+`on listener`, run on a timer that belongs to that script alone. The interval is set from inside
+the callback:
+
+```
+change_listener_par($NI_SIGNAL_TIMER_MS, 60000000 / $Tempo)
+```
+
+with `$Tempo` derived from `ms_to_ticks()`. The tick is not tied to notes: it runs while the
+instrument is loaded, and the scripts gate their own work on `$keys_down` or the sustain pedal. A
+player that never runs the callback leaves every such panel frozen on step 1 — the table shows its
+stored values, but the playhead never moves and nothing is sent to the engine.
+
+Two numbers matter. `ms_to_ticks` counts **1280 ticks per quarter note**, so `ms_to_ticks(500)` is
+1280 at 120 BPM; and the scripts' `60000000 / $Tempo` arithmetic comes out in milliseconds, which is
+what `change_listener_par` expects. The tick rate is not documented anywhere: it only becomes
+visible through the rate the panels run at, and there it falls out exactly — the arithmetic reduces
+to `640 × ms_per_quarter / ticks`, and a 32-step table that the original sweeps in **eight seconds
+at 120 BPM** is 250 ms per step, an eighth note, which is 1280 ticks. 960 would give 10.7 s and
+2880 3.6 s. [strong: the cycle time was read off the original's playhead; the interval a script has
+not asked for yet is open, this player uses 10 ms until it does]
+
+**6.6 Controllers are a bus.** `set_controller(number, value)` writes the same table the host's MIDI
+input writes, and `%CC[number]` reads it. Panels use controller numbers that are not connected to
+anything audible as a bus between slots: one script computes a value — an LFO step, a macro
+position — and the other slots read it back from `%CC`. Because the table is shared rather than
+per-script, it also reaches the engine, which is how a script's controller can drive a modulation.
+
 ## 7. What to do with a function you do not implement
 
 Ignore it, keep going, and say so once. A script calling an unknown function is common — libraries
@@ -139,8 +168,11 @@ selects nothing and the instrument plays no sound at all. Those builtins have to
 
 ## 8. What is not established
 
-* `on controller`, `on pgs_changed` and the listener callbacks: parsed and compiled, dispatch
-  semantics unverified.
+* `on pgs_changed`: parsed and compiled, dispatch semantics unverified.
+* The interval `on listener` uses before the script has asked for one; this player ticks at 10 ms.
+* What the engine does with a controller a script sends. The panels use CC numbers as a bus, but
+  KONTAKT also feeds them to the instrument's assigned controllers, and that path — a controller
+  driving a modulated parameter, such as the LFO sweeping a filter cutoff — is not implemented.
 * The exact meaning of several `$ENGINE_PAR_*` targets beyond volume, pan, tune, filter and sends.
 * Whether `wait()` suspends the callback without suspending the voice, and for how long a player
   should let it run.

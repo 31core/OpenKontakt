@@ -10,6 +10,8 @@
 
 pub mod biquad;
 pub mod convolution;
+pub mod voice_filter;
 
 pub use biquad::{Biquad, BiquadKind, MAX_CHANNELS};
 pub use convolution::Convolver;
+pub use voice_filter::cutoff_hz as voice_filter_cutoff_hz;

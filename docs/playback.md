@@ -176,7 +176,34 @@ a click. A few milliseconds of fade removes it and is too short to be heard as p
 there; a player that keeps such a voice "active" slowly fills its pool with inaudible voices, and
 the polyphony collapses long before the note count says it should.
 
-## 9. What is not established
+## 9. The per-voice filter
+
+**9.1 A group can carry a low-pass, and a panel can sweep it.** The filter is second order: the
+ratio between the original's output with a panel sweeping the cutoff and without it is a clean
+12 dB/octave slope. A fourth-order fit is 2 dB worse everywhere and needs a cutoff two to twelve
+times higher to explain the same slope. [verified]
+
+**9.2 The controller-to-cutoff curve.** The cutoff follows the controller exponentially:
+
+```
+cutoff Hz = 2 ^ (7.73 + 0.0405 × controller value)
+```
+
+fitted to one library's sweep, whose stored table runs from 127 down to 4 and back. Two ends land
+at about 210 Hz and 7.5 kHz. Treat the absolute numbers as provisional: the take it was fitted from
+is almost all release tail in the region where the filter moves (its level there is −60 to −75
+dBFS), so the fit describes the shape — exponential in the controller value rather than linear in a
+normalised knob — much better than it pins the endpoints, and a sustained-note reference would move
+the constants. [open]
+
+**9.3 One filter per voice.** A shared filter would smear a sweep across notes that are
+independently swept, and the cutoff has to be able to rise again while older notes still sound, so
+each voice carries its own coefficients and state.
+
+**9.4 Resonance.** Mild — the reference's spectra show no resonant peak at the cutoff, so the
+stored resonance of the group module the cutoff belongs to (0.1, about Q 0.6) is enough. [open]
+
+## 10. What is not established
 
 * The exact curve law of an AHDSR stage; only its endpoints and monotonicity are pinned.
 * The normalised-knob mapping away from the one anchor point (0.586 ↔ 500 ms).
