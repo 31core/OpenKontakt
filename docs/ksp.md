@@ -1,10 +1,10 @@
-# KSP: the script language a player has to run
+# KSP behaviour in Kontakt
 
 An instrument can carry up to five KSP scripts, and they are not decoration: a drum kit's mapping,
 a guitar's keyswitches and a piano's microphone mixer all live in them. A player that reads the
 script text but does not run it will load the instrument and play the wrong thing.
 
-This document is about the language as far as a player must implement it: what runs when, what a
+This document describes Kontakt’s script language: what runs when, what a
 script can do to a note, and which builtins change the sound. It does not describe the file layout
 of a script slot (`docs/format.md` §3.5) and it does not describe how a script draws its panel
 (`docs/ksp-panel.md`).
@@ -22,7 +22,8 @@ a silent or uninitialised instrument.
 
 * `on note` for a note-on, before the zone lookup, because the script can rewrite the note;
 * `on release` for a note-off, with the event's identity so the script can find what it started;
-* `on ui_control($x)` when a control changes, whether the user moved it or the script wrote it;
+* `on ui_control($x)` when the user changes a control; script assignments update its display
+  without recursively invoking the callback;
 * `on controller` for a MIDI CC;
 * `on listener` on that script's own timer, whether or not anything else is happening.
 
@@ -32,14 +33,8 @@ playable, and the `on ui_control` handler of every restored control is re-run so
 matching the panel. Skipping that replay loads the right numbers and plays the wrong sound — a
 mixer whose faders show the saved mix while the engine sits at the script's defaults.
 
-A **button** is the exception that proves the rule: a handler there is a click, and replaying one
-that was saved *unpressed* is a click that never happened. A button saved as pressed is different —
-it is the stored selection of a radio group, and its handler is often the only thing that lays the
-page out (a tab button is what moves the step tables into view). Replay pressed buttons, not the
-rest. Replaying every button in a radio group makes the last one win, whatever was saved.
-
-**1.5 Isolation.** A script that fails to parse is reported and skipped; it must not take the other
-four with it, and it must not take the instrument with it.
+The exact ordering of persistence restoration, UI callbacks and cross-slot notifications during
+loading remains unestablished; it must not be inferred from a particular interpreter’s strategy.
 
 ## 2. Variables and types
 
@@ -63,14 +58,8 @@ variables: a player has to know their values, because scripts compute with them.
 ## 3. Control flow
 
 `if … else … end if`, `while … end while` with `inc`/`dec`, `select $x … case … end select`,
-`function … end function` with `call`, and `exit`. The forms are ordinary; the two that a
-hand-written interpreter usually gets wrong are `select` (fall-through and `case` ranges) and
-functions, which have their own local scope and are the reason a script can call the same page
-switch from six places.
-
-**A script is not bounded by the player.** `while` loops that never terminate exist in real
-libraries — usually waiting on a controller that has not arrived. An interpreter that runs a script
-on the audio thread and does not bound it will hang the audio callback.
+`function … end function` with `call`, and `exit`. Functions can update slot-scoped variables;
+these updates remain visible after the function returns.
 
 ## 4. The event object
 
@@ -83,7 +72,9 @@ and can change what happens to it:
   `on release` callback, which sees the *new* note. A drum kit stores its kick at note 0 and plays
   it from C1 by rewriting the event; a choke test written as `if ($EVENT_NOTE = 16)` only fires if
   the rewrite survived to the release.
-* `play_note(note, velocity, offset, release)` — start an extra voice, independent of the event;
+* `play_note(note, velocity, offset, release)` — start an extra event and return its unique id.
+  Offset and positive duration are in microseconds; zero duration lets the sample finish, and
+  `-1` follows the parent event's note-off;
 * `note_off(id)` — stop a voice started earlier;
 * `change_vol` / `change_tune` / `change_pan` / `change_velo` — modify this event, in millidecibels,
   millicents and so on. Humanisation lives here.
@@ -117,7 +108,7 @@ makes every panel read "0.00 ms".
 than a group.
 
 **6.2 Panel.** `set_control_par` / `set_control_par_str` move, resize, hide, relabel and repaint a
-control; `get_ui_id` turns a control variable into an id. These are the panel's whole runtime API —
+control; `get_ui_id` turns a control variable into an id. These form the panel-control API —
 see `docs/ksp-panel.md`.
 
 **6.3 Persistence.** `make_persistent($x)` marks a variable, `read_persistent_var($x)` asks for it
@@ -126,6 +117,18 @@ back. The stored form is text: a name, then the values, one entry per variable o
 **6.4 Other.** `message()` writes to Kontakt's status line, `get_folder()` returns library paths,
 `load_ir_sample()` asks for a convolution impulse, `pgs_*` is cross-script shared state, `wait()`
 suspends for a moment.
+
+PGS keys are symbolic bare identifiers: `COUNTER` and `LEVEL` address separate shared arrays.
+`pgs_create_key`, `pgs_set_key_val`, `pgs_get_key_val` and `pgs_key_exists` operate on these names.
+Changes can notify other slots through `on pgs_changed`.
+
+`random(low, high)` produces integer values in the specified range. The native generator and
+seeding behaviour are unestablished. `set_menu_item_str` changes a menu row’s text.
+
+`find_mod` identifies a named modulator, and `find_target` identifies a named target. The native
+numbering and behaviour for unresolved references require separate verification. Controller
+assignments, target depth and transfer curves participate in modulation; their complete numerical
+laws remain unestablished.
 
 **6.5 The listener clock.** A panel's LFO, arpeggiator and step display are one callback,
 `on listener`, run on a timer that belongs to that script alone. The interval is set from inside
@@ -147,7 +150,7 @@ visible through the rate the panels run at, and there it falls out exactly — t
 to `640 × ms_per_quarter / ticks`, and a 32-step table that the original sweeps in **eight seconds
 at 120 BPM** is 250 ms per step, an eighth note, which is 1280 ticks. 960 would give 10.7 s and
 2880 3.6 s. [strong: the cycle time was read off the original's playhead; the interval a script has
-not asked for yet is open, this player uses 10 ms until it does]
+not asked for yet remains open]
 
 **6.6 Controllers are a bus.** `set_controller(number, value)` writes the same table the host's MIDI
 input writes, and `%CC[number]` reads it. Panels use controller numbers that are not connected to
@@ -155,27 +158,11 @@ anything audible as a bus between slots: one script computes a value — an LFO 
 position — and the other slots read it back from `%CC`. Because the table is shared rather than
 per-script, it also reaches the engine, which is how a script's controller can drive a modulation.
 
-## 7. What to do with a function you do not implement
+## 7. Unestablished behaviour
 
-Ignore it, keep going, and say so once. A script calling an unknown function is common — libraries
-use functions from newer Kontakt versions than the file was authored for — and the alternatives are
-worse: aborting the callback loses the whole note, and pretending the function did something
-invents behaviour.
-
-The exception is a function whose *return value* feeds a comparison: `search(%array, $x)` returning
-0 instead of −1 makes `if (search(...) = -1)` false, which is how a group-routing loop silently
-selects nothing and the instrument plays no sound at all. Those builtins have to be right.
-
-## 8. What is not established
-
-* `on pgs_changed`: parsed and compiled, dispatch semantics unverified.
-* The interval `on listener` uses before the script has asked for one; this player ticks at 10 ms.
-* What the engine does with a controller a script sends. The panels use CC numbers as a bus, but
-  KONTAKT also feeds them to the instrument's assigned controllers, and that path — a controller
-  driving a modulated parameter, such as the LFO sweeping a filter cutoff — is not implemented.
-* The exact meaning of several `$ENGINE_PAR_*` targets beyond volume, pan, tune, filter and sends.
-* Whether `wait()` suspends the callback without suspending the voice, and for how long a player
-  should let it run.
-* How a script's `set_engine_par` interacts with a parameter the player models with a different
-  range.
-* Round-robin selection that lives in a script rather than in the start-criteria record.
+* The exact ordering and reentrancy of cross-slot PGS notifications.
+* The listener interval before a script explicitly requests one.
+* The scheduling and resumption semantics of long callbacks containing `wait()`.
+* Native modulation curves, polarity, depth and normalised parameter mappings.
+* The precise semantics of engine targets not independently measured.
+* The native random generator, seed and event-to-event sequence.

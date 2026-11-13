@@ -428,6 +428,13 @@ impl Parser {
                 self.pos += 1;
                 Ok(Stmt::Exit)
             }
+            Tok::Ident(word) if word == "call" => {
+                self.pos += 1;
+                match self.expr()? {
+                    expression @ Expr::Call(_, _) => Ok(Stmt::Expr(expression)),
+                    _ => Err("expected a function name after call".to_string()),
+                }
+            }
             _ => {
                 let lhs = self.expr()?;
                 if self.eat(":=") {
@@ -861,6 +868,11 @@ mod tests {
         assert!(program.functions.contains_key("all_off1"));
         assert!(program.functions["all_off1"].params.is_empty());
         assert_eq!(program.callbacks.len(), 1);
+        assert!(
+            matches!(&program.callbacks[0].body[0], Stmt::Expr(Expr::Call(name, args))
+            if name == "all_off1" && args.is_empty())
+        );
+        assert_eq!(program.callbacks[0].body.len(), 1);
     }
 
     /// Retail libraries write long tables one row per line and put `...` where the row continues.

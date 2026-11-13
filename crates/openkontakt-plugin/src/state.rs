@@ -1,6 +1,5 @@
 use atomic_float::AtomicF32;
 use nice_plug_egui::RepaintNotifier;
-use openkontakt::ksp::GroupInfo;
 use openkontakt::{Diagnostic, Instrument, KspRuntime, load_samples};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,10 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct LoadedInstrument {
+    pub control_notices: HashMap<(usize, String), String>,
     pub instrument: Instrument,
     /// Compiled KSP scripts plus the engine parameters they drive.
     pub ksp: Arc<KspRuntime>,
     pub samples: HashMap<i32, Arc<openkontakt::AudioSample>>,
+    /// Groups with authored velocity fades must not also receive the inferred boundary fade.
+    pub explicit_velocity_fades: Vec<bool>,
     pub diagnostics: Vec<Diagnostic>,
     pub bytes_loaded: u64,
     /// Bytes mapped from disk but not decoded: this is what a streaming sample costs.
@@ -104,14 +106,6 @@ pub fn load_instrument(path: &std::path::Path) -> Result<LoadedInstrument, openk
         .iter()
         .map(|slot| slot.text.clone())
         .collect();
-    let groups: Vec<GroupInfo> = instrument
-        .groups
-        .iter()
-        .map(|group| GroupInfo {
-            release_trigger: group.release_trigger,
-            envelope: openkontakt::envelope::group_amp_envelope(group),
-        })
-        .collect();
     // Diagnostic switch: some instruments route every note through their own script, which makes
     // it impossible to tell "the sample path is broken" from "the script is". Skipping the scripts
     // plays the plain zone mapping instead.
@@ -121,15 +115,75 @@ pub fn load_instrument(path: &std::path::Path) -> Result<LoadedInstrument, openk
     } else {
         texts
     };
-    let ksp = Arc::new(KspRuntime::compile_with_groups(&texts, &root, groups));
+    let ksp = Arc::new(KspRuntime::compile_instrument(
+        &texts,
+        &root,
+        &instrument.groups,
+    ));
+    for group in &instrument.groups {
+        ksp.engine
+            .set_group_gain(group.index, group.volume.max(0.0));
+    }
     ksp.initialize();
-    for slot in &instrument.scripts {
-        let entries: Vec<(String, Vec<i64>)> = slot
-            .persistent
-            .iter()
-            .map(|entry| (entry.name.clone(), entry.values.clone()))
-            .collect();
-        ksp.apply_persistent(slot.index, &entries);
+    let persistent = instrument
+        .scripts
+        .iter()
+        .map(|slot| {
+            let entries = slot
+                .persistent
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.values.clone()))
+                .collect();
+            (slot.index, entries)
+        })
+        .collect::<Vec<_>>();
+    ksp.apply_persistent_batch(&persistent);
+    let mut control_notices = HashMap::new();
+    for slot in 0..ksp.slot_count() {
+        let controls = ksp.controls(slot);
+        if controls.iter().any(|c| c.name == "Noise") {
+            if let Some(groups) = ksp.array_variable(slot, "%Room_Tone_Groups") {
+                if !groups.is_empty()
+                    && groups
+                        .iter()
+                        .all(|g| !instrument.zones.iter().any(|z| z.group_index as i64 == *g))
+                {
+                    control_notices.insert(
+                        (slot, "Noise".into()),
+                        "Unavailable in this preset: the room-tone groups contain no sample zones."
+                            .into(),
+                    );
+                }
+            }
+        }
+        if controls.iter().any(|c| c.name == "Rel_Trig") {
+            let groups = (1..=24)
+                .filter_map(|i| ksp.array_variable(slot, &format!("%Art_Release_{i:02}_Groups")))
+                .flatten()
+                .collect::<Vec<_>>();
+            if !groups.is_empty()
+                && groups.iter().all(|g| {
+                    let parsed = usize::try_from(*g)
+                        .ok()
+                        .and_then(|g| ksp.engine.modulation.get(g))
+                        .and_then(|g| g.find("REL_VOLUME"))
+                        .is_some();
+                    let preserved = usize::try_from(*g)
+                        .ok()
+                        .and_then(|g| instrument.groups.get(g))
+                        .is_some_and(|g| {
+                            g.children.iter().any(|c| {
+                                c.body
+                                    .windows(b"REL_VOLUME".len())
+                                    .any(|w| w == b"REL_VOLUME")
+                            })
+                        });
+                    !parsed && !preserved
+                })
+            {
+                control_notices.insert((slot,"Rel_Trig".into()),"Unavailable in this preset: the release-volume modulator requested by the script is absent. Release samples are separate from this control.".into());
+            }
+        }
     }
     for message in ksp.diagnostics() {
         // Script errors belong on the console, not in a status bar: they are long, they are the
@@ -143,10 +197,20 @@ pub fn load_instrument(path: &std::path::Path) -> Result<LoadedInstrument, openk
         });
     }
 
+    let mut explicit_velocity_fades = vec![false; instrument.groups.len()];
+    for zone in &instrument.zones {
+        if zone.fade_low_velocity > 0 || zone.fade_high_velocity > 0 {
+            if let Some(explicit) = explicit_velocity_fades.get_mut(zone.group_index) {
+                *explicit = true;
+            }
+        }
+    }
     Ok(LoadedInstrument {
+        control_notices,
         instrument,
         ksp,
         samples: loaded.samples,
+        explicit_velocity_fades,
         diagnostics,
         bytes_loaded: loaded.bytes_loaded,
         bytes_mapped: loaded.bytes_mapped,
@@ -226,6 +290,39 @@ impl SharedState {
             .push(GuiNote { key, velocity, on });
         self.repaint.request_repaint();
         let _ = self.repaint_tx.send(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "requires a preset whose Noise control references empty room-tone groups"]
+    fn labels_missing_room_tone_without_remapping_it() {
+        let path = std::env::var("OPENKONTAKT_EMPTY_ROOM_TONE_NKI").expect("set the preset path");
+        let loaded = super::load_instrument(std::path::Path::new(&path)).unwrap();
+        assert!(
+            loaded
+                .control_notices
+                .iter()
+                .any(|((_, name), reason)| name == "Noise" && reason.contains("no sample zones"))
+        );
+        assert!(!loaded.ksp.engine.external_envelopes_enabled);
+        for (index, slot) in loaded.instrument.scripts.iter().enumerate() {
+            if let Some(groups) = loaded.ksp.array_variable(slot.index, "%Room_Tone_Groups") {
+                if loaded
+                    .control_notices
+                    .contains_key(&(index, "Noise".into()))
+                {
+                    assert!(groups.iter().all(|g| {
+                        !loaded
+                            .instrument
+                            .zones
+                            .iter()
+                            .any(|z| z.group_index as i64 == *g)
+                    }));
+                }
+            }
+        }
     }
 }
 

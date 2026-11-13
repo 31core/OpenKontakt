@@ -527,6 +527,19 @@ that value produces a preset that Kontakt rejects as corrupt. **[open]** as to t
 
 ### 3.6 Envelopes — a group's `0x3B`
 
+Modulation records occupy presence-prefixed slots in `0x3B`/`0x3C` arrays
+with the `00 12 00` prefix. Internal `0x0D` objects use version `0x80`; external `0x0C` objects use
+`0x100`. Their counted public sections contain a target count and target names/depths/aliases,
+then the source name. External source kind 4 includes a CC byte and four opaque assignment bytes;
+kind 6 identifies velocity. The meanings of other observed source-kind numbers are unestablished. **[strong]**: checked
+across the supplied instrument's groups, not established for every writer/version.
+
+Observed external point curves store a mode/polarity byte, a bounded point count, a flag byte,
+the first point's Y/shape with implicit X=0, then X/Y/shape triplets. AHDSR destinations include
+their internal-envelope slot; amplitude and filter-envelope targets must stay separate. Native curve curvature, polarity interpretation and parameter time laws
+remain **[open]**. The field layouts of other targets, including play-position variants, are
+unestablished. The internal header before its final counted source name remains opaque.
+
 A group's amplitude envelope is not a direct child of the group. It sits inside the modulator
 array:
 
@@ -571,6 +584,16 @@ struct EffectSlot {
 
 The slot's child chunk id is the module's class id, and the module body is its parameter block in
 read order. Two things are worth knowing before writing a decoder:
+
+For module `0x18`, subtype 24 has a 44-byte public block: two little-endian `u32` type words, both
+24, followed by three `(frequency_hz, Q, gain_db)` float triplets. This is a three-band parametric
+EQ, not the short low/high-pass record ending in normalised cutoff/resonance. **[strong]**: the
+triplets have consistent physical ranges in the inspected preset; native knob and DSP equivalence
+have not been established. Other subtypes remain separate and unknown layouts stay opaque.
+
+The short `0x18` block with type words `(7, 7)` is treated as high-pass rather than low-pass;
+its tail remains the normalised cutoff/resonance pair. **[strong]**: its saved position and the
+script's independently addressed HP controls agree; the exact native filter algorithm is open.
 
 * the parameter block is **per module** and most of the layouts are undocumented, so a reader that
   keeps it raw can still round-trip what it does not understand;

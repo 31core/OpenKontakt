@@ -92,7 +92,7 @@ impl Zone {
     /// Kontakt's output is continuous across a velocity-layer boundary while the two layers'
     /// recordings are not: one library steps from `C3 24 39` to `C3 40 55` is 12 dB in this
     /// reader and 1 dB in Kontakt. `fade` is measured in velocity units; zero restores the plain
-    /// range test.
+    /// range test for zones without explicit fades. Authored fades always take precedence.
     ///
     /// A complementary pair of ramps (weights summing to one) was tried and made things worse: the
     /// two layers are up to 15 dB apart in level, so blending them linearly digs a dip at the
@@ -104,6 +104,24 @@ impl Zone {
         let v = velocity as i16;
         if key < self.low_key || key > self.high_key {
             return 0.0;
+        }
+        // Explicit fades are inside the stored range. Expanding these ranges with the fallback
+        // fade instead plays neighbouring recordings at full gain throughout the overlap.
+        if self.fade_low_velocity > 0 || self.fade_high_velocity > 0 {
+            if v < self.low_velocity || v > self.high_velocity {
+                return 0.0;
+            }
+            let low = if self.fade_low_velocity > 0 {
+                ((v - self.low_velocity + 1) as f32 / self.fade_low_velocity as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let high = if self.fade_high_velocity > 0 {
+                ((self.high_velocity - v) as f32 / self.fade_high_velocity as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            return low.min(high);
         }
         if fade <= 0 {
             return if v >= self.low_velocity && v <= self.high_velocity {
@@ -453,4 +471,42 @@ fn parse_zone_slices(body: &[u8]) -> Result<Option<ZoneSlices>> {
         grid_length,
         boundaries,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layer(low: i16, high: i16, fade_low: i16, fade_high: i16) -> Zone {
+        let mut public = vec![0; 12];
+        for value in [low, high, 60, 60, fade_low, fade_high, 0, 0, 60] {
+            public.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [1.0f32, 0.0, 1.0] {
+            public.extend_from_slice(&value.to_le_bytes());
+        }
+        public.extend_from_slice(&[0; 6]); // v0x9A, no sample
+        parse_public(0, 0, 0x9A, 0, &public).unwrap().0
+    }
+
+    #[test]
+    fn explicit_velocity_overlap_does_not_double_the_layers() {
+        let a = layer(40, 55, 0, 8);
+        let b = layer(48, 90, 8, 0);
+        for v in 48..=55 {
+            let sum = a.velocity_weight(60, v, 8) + b.velocity_weight(60, v, 8);
+            assert!((sum - 1.0).abs() < 1e-6, "velocity {v}, sum {sum}");
+        }
+        assert_eq!(a.velocity_weight(60, 56, 8), 0.0);
+        assert_eq!(b.velocity_weight(60, 47, 8), 0.0);
+        assert_eq!(b.velocity_weight(61, 60, 8), 0.0);
+    }
+
+    #[test]
+    fn zones_without_explicit_fades_keep_the_fallback() {
+        let zone = layer(40, 55, 0, 0);
+        assert_eq!(zone.velocity_weight(60, 39, 0), 0.0);
+        assert!(zone.velocity_weight(60, 39, 8) > 0.0);
+        assert_eq!(zone.velocity_weight(60, 48, 8), 1.0);
+    }
 }

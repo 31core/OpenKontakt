@@ -28,6 +28,7 @@ pub mod group;
 pub mod instrument;
 pub mod ksp;
 pub mod ksp_ui;
+pub mod modulation;
 pub mod ncw;
 pub mod nis;
 pub mod nkc;

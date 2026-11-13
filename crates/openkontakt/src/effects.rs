@@ -372,6 +372,14 @@ fn try_rack(public: &[u8], version: u16, framing: RackFraming) -> Result<Vec<Opt
 /// Parameters of the modules the engine implements. Unknown modules keep `params` raw.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModuleParams {
+    HighPass {
+        cutoff: f32,
+        resonance: f32,
+    },
+    /// Three parametric bands: frequency in Hz, Q, gain in dB.
+    Equalizer {
+        bands: [[f32; 3]; 3],
+    },
     Gainer {
         gain: f32,
     },
@@ -428,10 +436,33 @@ pub fn decode(slot: &EffectSlot) -> ModuleParams {
             .map(|gain| ModuleParams::Gainer { gain })
             .unwrap_or(ModuleParams::Opaque),
         0x18 => {
+            // This subtype has two type words followed by three (Hz, Q, dB) triplets, rather
+            // than the two normalised floats of a low/high-pass filter.
+            if slot.params.len() == 44 && slot.params[..8] == [24, 0, 0, 0, 24, 0, 0, 0] {
+                let values = floats_of(&slot.params[8..], 9);
+                if values.len() == 9
+                    && values.chunks_exact(3).all(|b| {
+                        (10.0..=30_000.0).contains(&b[0])
+                            && (0.01..=100.0).contains(&b[1])
+                            && (-60.0..=60.0).contains(&b[2])
+                    })
+                {
+                    return ModuleParams::Equalizer {
+                        bands: std::array::from_fn(|i| {
+                            [values[i * 3], values[i * 3 + 1], values[i * 3 + 2]]
+                        }),
+                    };
+                }
+            }
             // `i32 filter_type` then optional flag byte from 0x92, then cutoff/resonance at the
             // end. The tail is what the engine needs; scan from the end for two plausible floats.
             let _ = reader.i32();
             match (slot.params.len(), read_filter_tail(&slot.params)) {
+                (_, Some((cutoff, resonance)))
+                    if slot.params.get(..8) == Some(&[7, 0, 0, 0, 7, 0, 0, 0]) =>
+                {
+                    ModuleParams::HighPass { cutoff, resonance }
+                }
                 (_, Some((cutoff, resonance))) => ModuleParams::Filter { cutoff, resonance },
                 _ => ModuleParams::Opaque,
             }
@@ -543,6 +574,52 @@ pub fn group_rack(private: &[u8]) -> Option<Rack> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parametric_eq_is_not_decoded_as_a_low_pass() {
+        let bands = [
+            [150.0f32, 1.5, -3.0],
+            [1200.0, 0.8, 2.0],
+            [14000.0, 1.2, 0.0],
+        ];
+        let mut params = vec![24u32.to_le_bytes(), 24u32.to_le_bytes()].concat();
+        for value in bands.iter().flatten() {
+            params.extend_from_slice(&value.to_le_bytes());
+        }
+        let slot = EffectSlot {
+            module: 0x18,
+            module_version: 0x92,
+            params,
+            module_private: vec![],
+            bypass: false,
+            output_gain: 1.0,
+            dry_level: 0.0,
+        };
+        assert_eq!(decode(&slot), ModuleParams::Equalizer { bands });
+    }
+
+    #[test]
+    fn high_pass_subtype_keeps_its_response_shape() {
+        let mut params = vec![7u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
+        params.extend_from_slice(&0.25f32.to_le_bytes());
+        params.extend_from_slice(&0.1f32.to_le_bytes());
+        let slot = EffectSlot {
+            module: 0x18,
+            module_version: 0x92,
+            params,
+            module_private: vec![],
+            bypass: false,
+            output_gain: 1.0,
+            dry_level: 0.0,
+        };
+        assert_eq!(
+            decode(&slot),
+            ModuleParams::HighPass {
+                cutoff: 0.25,
+                resonance: 0.1
+            }
+        );
+    }
 
     /// A group's rack is eight presence bytes with a slot chunk after a `1`, and then a trailer
     /// that belongs to the rack rather than to a slot. The known framings rejected the whole body

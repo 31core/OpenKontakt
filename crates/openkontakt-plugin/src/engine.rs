@@ -44,6 +44,8 @@ fn attack_exponent(curve: f32) -> f32 {
 /// Per-voice amplitude envelope built from the group's AHDSR at note start.
 #[derive(Clone, Copy, Debug)]
 struct Envelope {
+    time_scale: f32,
+    release_total: f32,
     stage: EnvelopeStage,
     level: f32,
     /// Samples elapsed in the attack stage, and its length.
@@ -61,12 +63,20 @@ struct Envelope {
 
 impl Envelope {
     fn new(envelope: Ahdsr, sample_rate: f32) -> Self {
-        let rate = sample_rate.max(1.0) / 1000.0; // samples per millisecond
+        // Diagnostic only: a fit to one render does not establish the file's time units.
+        let scale = std::env::var("OPENKONTAKT_ENV_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(1.0);
+        let rate = sample_rate.max(1.0) / 1000.0 * scale; // samples per millisecond
         let attack_samples = (envelope.attack_ms.max(0.0) * rate).max(1.0);
         let decay_samples = (envelope.decay_ms.max(0.0) * rate).max(1.0);
         let release_samples = (envelope.release_ms.max(1.0) * rate).max(1.0);
         let sustain = envelope.sustain.clamp(0.0, 1.0);
         Self {
+            time_scale: scale,
+            release_total: release_samples,
             stage: EnvelopeStage::Attack,
             level: 0.0,
             attack_elapsed: 0.0,
@@ -77,6 +87,26 @@ impl Envelope {
             sustain,
             release_step: 1.0 / release_samples,
             release_left: release_samples,
+        }
+    }
+
+    /// Advance one sample and return the gain to apply.
+    fn update(&mut self, envelope: Ahdsr, sample_rate: f32) {
+        let rate = sample_rate.max(1.0) / 1000.0 * self.time_scale;
+        self.attack_samples = (envelope.attack_ms.max(0.0) * rate).max(1.0);
+        self.attack_exponent = attack_exponent(envelope.attack_curve);
+        self.sustain = envelope.sustain.clamp(0.0, 1.0);
+        self.decay_dec = (1.0 - self.sustain) / (envelope.decay_ms.max(0.0) * rate).max(1.0);
+        let release = (envelope.release_ms.max(1.0) * rate).max(1.0);
+        if (release - self.release_total).abs() > 0.5 {
+            if self.stage == EnvelopeStage::Release {
+                let elapsed = self.release_total - self.release_left;
+                self.release_left = (release - elapsed).max(1.0);
+                self.release_step = self.level / self.release_left;
+            } else {
+                self.release_left = release;
+            }
+            self.release_total = release;
         }
     }
 
@@ -138,6 +168,17 @@ impl Envelope {
 }
 
 struct Voice {
+    release_parent: Option<i64>,
+    release_at: Option<u64>,
+    group_index: usize,
+    unmixed_gain: f32,
+    base_pan: f32,
+    stored_group_pan: f32,
+    source_increment: f64,
+    stored_group_tune: f64,
+    event_volume_db: f32,
+    event_pan: f32,
+    event_tune: f64,
     active: bool,
     note: u8,
     /// Reads the sample and caches the `.ncw` block it is playing, so the audio thread never
@@ -172,6 +213,17 @@ struct Voice {
 impl Default for Voice {
     fn default() -> Self {
         Self {
+            release_parent: None,
+            release_at: None,
+            group_index: 0,
+            unmixed_gain: 0.0,
+            base_pan: 0.0,
+            stored_group_pan: 0.0,
+            source_increment: 1.0,
+            stored_group_tune: 1.0,
+            event_volume_db: 0.0,
+            event_pan: 0.0,
+            event_tune: 0.0,
             active: false,
             note: 0,
             sample: SampleCursor::new(Arc::new(AudioSample::silent())),
@@ -186,6 +238,8 @@ impl Default for Voice {
             gain_right: 0.0,
             base_gain: 0.0,
             env: Envelope {
+                time_scale: 1.0,
+                release_total: 1.0,
                 stage: EnvelopeStage::Off,
                 level: 0.0,
                 attack_elapsed: 0.0,
@@ -204,6 +258,27 @@ impl Default for Voice {
             bus: 0,
             event_id: 0,
         }
+    }
+}
+
+impl Voice {
+    fn sync_mix(&mut self, state: &openkontakt::ksp::EngineState) {
+        let pan = state
+            .group_pan(self.group_index)
+            .unwrap_or(self.stored_group_pan);
+        let tune = state
+            .group_tune(self.group_index)
+            .map(f64::from)
+            .unwrap_or(self.stored_group_tune);
+        self.base_gain = self.unmixed_gain
+            * state.group_gain(self.group_index)
+            * 10f32.powf(self.event_volume_db.clamp(-120.0, 60.0) / 20.0);
+        let angle = (self.base_pan + pan + self.event_pan)
+            .clamp(-1.0, 1.0)
+            .mul_add(std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4);
+        self.gain_left = angle.cos();
+        self.gain_right = angle.sin();
+        self.increment = self.source_increment * tune * 2f64.powf(self.event_tune / 12.0);
     }
 }
 
@@ -424,11 +499,16 @@ impl Engine {
             if slot.is_none() {
                 continue;
             }
-            if let Some(value) =
-                loaded
-                    .ksp
-                    .engine
-                    .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, 0)
+            if let Some(value) = loaded
+                .ksp
+                .engine
+                .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, -1)
+                .or_else(|| {
+                    loaded
+                        .ksp
+                        .engine
+                        .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, 0)
+                })
             {
                 overrides.insert(index, value != 0);
             }
@@ -538,32 +618,11 @@ impl Engine {
 
     /// Retune the master filter from the script's current values (0..1 knobs).
     fn sync_filter(&mut self) {
-        let Some(loaded) = self.current.clone() else {
+        let Some(loaded) = self.current.as_ref() else {
             return;
         };
-        let cutoff = loaded
-            .ksp
-            .engine
-            .parameter_any("ENGINE_PAR_CUTOFF")
-            .map(|value| value as f32 / 1_000_000.0)
-            .unwrap_or(self.filter_cutoff);
-        let resonance = loaded
-            .ksp
-            .engine
-            .parameter_any("ENGINE_PAR_RESONANCE")
-            .map(|value| value as f32 / 1_000_000.0)
-            .unwrap_or(self.filter_resonance);
-        if (cutoff - self.filter_cutoff).abs() < 1e-4
-            && (resonance - self.filter_resonance).abs() < 1e-4
-        {
-            return;
-        }
-        self.filter_cutoff = cutoff;
-        self.filter_resonance = resonance;
-        for fx in &mut self.insert_chain {
-            if fx.is_filter() {
-                fx.retune_filter(cutoff, resonance);
-            }
+        for effect in &mut self.insert_chain {
+            effect.sync_parameters(&loaded.ksp.engine);
         }
     }
 
@@ -574,9 +633,16 @@ impl Engine {
     /// Called once per audio block, before rendering: pulls the script's live filter and send
     /// settings, and loads an impulse response the first time a script asks for it.
     pub fn prepare_block(&mut self) {
+        if let Some(loaded) = self.current.clone() {
+            for dispatch in loaded.ksp.engine.take_ui_dispatches() {
+                self.execute_actions(&dispatch.actions, dispatch.allowed_groups.as_deref());
+            }
+        }
+        self.sync_voice_mix();
         self.sync_filter();
         self.sync_voice_filter();
         self.tick_listeners();
+        self.sync_voice_envelopes();
         // A script toggling an effect bypass has to be picked up while notes are sounding.
         if let Some(loaded) = self.current.as_ref() {
             let mut changed = false;
@@ -585,7 +651,15 @@ impl Engine {
                 let value = loaded
                     .ksp
                     .engine
-                    .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, 0);
+                    .get_cached("ENGINE_PAR_EFFECT_BYPASS", -1, index as i64, -1)
+                    .or_else(|| {
+                        loaded.ksp.engine.get_cached(
+                            "ENGINE_PAR_EFFECT_BYPASS",
+                            -1,
+                            index as i64,
+                            0,
+                        )
+                    });
                 if let Some(value) = value {
                     if stored.get(&index).copied() != Some(value != 0) {
                         changed = true;
@@ -883,7 +957,10 @@ impl Engine {
         );
         self.changed_notes[key as usize & 127] = None;
         for voice in &mut self.voices {
-            if voice.active && voice.note == key && voice.env.stage != EnvelopeStage::Release {
+            if voice.active
+                && voice.release_parent == Some(id)
+                && voice.env.stage != EnvelopeStage::Release
+            {
                 voice.env.release();
             }
         }
@@ -927,15 +1004,70 @@ impl Engine {
     fn execute_actions(&mut self, actions: &[ScriptAction], allowed: Option<&[bool]>) {
         for action in actions {
             match action {
+                ScriptAction::ChangeEvent {
+                    kind,
+                    id,
+                    value,
+                    relative,
+                } => {
+                    for voice in &mut self.voices {
+                        if !voice.active || voice.event_id != *id {
+                            continue;
+                        }
+                        match kind.as_str() {
+                            "change_vol" => {
+                                let value = *value as f32 / 1000.0;
+                                voice.event_volume_db = if *relative {
+                                    voice.event_volume_db + value
+                                } else {
+                                    value
+                                };
+                            }
+                            "change_tune" => {
+                                let value = *value as f64 / 100_000.0;
+                                voice.event_tune = if *relative {
+                                    voice.event_tune + value
+                                } else {
+                                    value
+                                };
+                            }
+                            "change_pan" => {
+                                let value = *value as f32 / 1000.0;
+                                voice.event_pan = if *relative {
+                                    voice.event_pan + value
+                                } else {
+                                    value
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 ScriptAction::PlayNote {
+                    id,
+                    parent,
                     note,
                     velocity,
-                    offset: _,
-                    release: _,
+                    offset,
+                    release,
                 } => {
                     let note = (*note).clamp(0, 127) as u8;
                     let velocity = (*velocity).clamp(1, 127) as u8;
+                    let age = self.age_counter;
                     self.trigger(note, velocity, allowed);
+                    for voice in self.voices.iter_mut().filter(|v| v.active && v.age > age) {
+                        voice.event_id = *id;
+                        voice.release_parent = (*release == -1).then_some(*parent);
+                        voice.release_at = (*release > 0).then(|| {
+                            self.samples_rendered
+                                + (*release as f64 * self.sample_rate as f64 / 1_000_000.0).round()
+                                    as u64
+                        });
+                        let offset_frames = (*offset).max(0) as f64
+                            * voice.sample.sample().sample_rate as f64
+                            / 1_000_000.0;
+                        voice.position = (voice.position + offset_frames).min(voice.end_frame);
+                    }
                 }
                 ScriptAction::NoteOff { id } => {
                     for voice in &mut self.voices {
@@ -947,6 +1079,37 @@ impl Engine {
                 // Handled where the event is triggered: the rewrite has to happen before the
                 // zones are matched, not after.
                 ScriptAction::ChangeNote { .. } => {}
+            }
+        }
+        self.sync_voice_mix();
+    }
+
+    fn sync_voice_mix(&mut self) {
+        let Some(loaded) = self.current.as_ref() else {
+            return;
+        };
+        for voice in self.voices.iter_mut().filter(|v| v.active) {
+            voice.sync_mix(&loaded.ksp.engine);
+        }
+    }
+
+    fn sync_voice_envelopes(&mut self) {
+        if !self
+            .current
+            .as_ref()
+            .is_some_and(|loaded| loaded.ksp.engine.external_envelopes_enabled)
+        {
+            return;
+        }
+        let mut envelopes = HashMap::new();
+        for voice in self.voices.iter().filter(|v| v.active) {
+            envelopes
+                .entry(voice.group_index)
+                .or_insert_with(|| self.voice_envelope(voice.group_index));
+        }
+        for voice in self.voices.iter_mut().filter(|v| v.active) {
+            if let Some(envelope) = envelopes.get(&voice.group_index) {
+                voice.env.update(*envelope, self.sample_rate);
             }
         }
     }
@@ -986,6 +1149,11 @@ impl Engine {
                 continue;
             }
             members.sort_by_key(|(position, _)| *position);
+            // The script may have selected one position across several microphones. Their
+            // group count is not a second RR cycle; do not veto that selection with our counter.
+            if members.first().map(|m| m.0) == members.last().map(|m| m.0) {
+                continue;
+            }
             // The cycle length is one past the highest position. Every group sharing the record
             // plays when its own position comes round — *all* of them, not one: a multi-mic
             // library puts each microphone's RR1 and RR2 in separate groups, and a note has to
@@ -1072,7 +1240,17 @@ impl Engine {
             .and_then(|value| value.parse().ok())
             .unwrap_or(8);
         for zone in &instrument.zones {
-            let layer_weight = zone.velocity_weight(key, velocity_127, fade);
+            let fallback_fade = if loaded
+                .explicit_velocity_fades
+                .get(zone.group_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                0
+            } else {
+                fade
+            };
+            let layer_weight = zone.velocity_weight(key, velocity_127, fallback_fade);
             if layer_weight <= 0.0 {
                 continue;
             }
@@ -1180,7 +1358,6 @@ impl Engine {
                 * program_volume
                 * zone.volume.max(0.0)
                 * zone_gain
-                * group.volume.max(0.0)
                 * velocity_gain
                 * layer_weight)
                 .clamp(0.0, 8.0);
@@ -1198,6 +1375,17 @@ impl Engine {
 
             started += 1;
             self.start_voice(Voice {
+                release_parent: Some(event_id),
+                release_at: None,
+                group_index: zone.group_index,
+                unmixed_gain: base_gain,
+                base_pan: zone.pan + program.pan,
+                stored_group_pan: group.pan,
+                source_increment: increment / group.tune.max(0.0001) as f64,
+                stored_group_tune: group.tune.max(0.0001) as f64,
+                event_volume_db: 0.0,
+                event_pan: 0.0,
+                event_tune: 0.0,
                 active: true,
                 note: event_key,
                 sample: SampleCursor::new(sample),
@@ -1259,7 +1447,7 @@ impl Engine {
                 .ksp
                 .engine
                 .parameter(name, group_index as i64, 0, -1)
-                .or_else(|| loaded.ksp.engine.parameter(name, 0, 0, -1))
+                .or_else(|| loaded.ksp.engine.parameter(name, -1, 0, -1))
                 .map(|value| value as f32 / 1_000_000.0)
                 .filter(|value| value.is_finite())
         };
@@ -1275,7 +1463,10 @@ impl Engine {
         if let Some(value) = parameter("ENGINE_PAR_SUSTAIN") {
             envelope.sustain = value.clamp(0.0, 1.0);
         }
-        envelope
+        loaded
+            .ksp
+            .engine
+            .modulate_amp_envelope(group_index, envelope)
     }
 
     /// Put a voice in the pool, making room if the polyphony limit is reached.
@@ -1359,7 +1550,10 @@ impl Engine {
         // The sounding voices release immediately; the release-trigger samples wait for the
         // script, whose `on release` decides which groups may play them.
         for voice in &mut self.voices {
-            if voice.active && voice.note == key && voice.env.stage != EnvelopeStage::Release {
+            if voice.active
+                && voice.release_parent == Some(id)
+                && voice.env.stage != EnvelopeStage::Release
+            {
                 voice.env.release();
             }
         }
@@ -1395,6 +1589,14 @@ impl Engine {
         for voice in &mut self.voices {
             if !voice.active {
                 continue;
+            }
+
+            if voice
+                .release_at
+                .is_some_and(|at| self.samples_rendered >= at)
+            {
+                voice.release_at = None;
+                voice.env.release();
             }
 
             if voice.env.stage == EnvelopeStage::Off {
@@ -1482,11 +1684,13 @@ impl Engine {
                 send_input_right += bus_right * self.send_level;
             }
         }
-        let trace = std::env::var("OPENKONTAKT_TRACE").is_ok()
-            && self.trace_count < 6
-            && left.abs() > 0.05;
+        let trace =
+            std::env::var("OPENKONTAKT_TRACE").is_ok() && self.trace_count < 6 && left.abs() > 0.05;
         if trace {
-            eprintln!("debug: pre-chain {left:.5} {} units", self.insert_chain.len());
+            eprintln!(
+                "debug: pre-chain {left:.5} {} units",
+                self.insert_chain.len()
+            );
         }
         for fx in &mut self.insert_chain {
             let (l, r) = fx.process(left, right);
@@ -1514,6 +1718,61 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_group_mix_and_event_changes_reach_existing_voices() {
+        let runtime = openkontakt::KspRuntime::compile(
+            &[Some(
+                r#"
+        on init
+          declare ui_knob $mute(0,1000000,1)
+          set_engine_par($ENGINE_PAR_PAN,1000000,0,-1,-1)
+          set_engine_par($ENGINE_PAR_TUNE,666667,0,0,-1)
+        end on
+        on ui_control($mute)
+          set_engine_par($ENGINE_PAR_VOLUME,$mute,0,-1,-1)
+        end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        let mut engine = Engine::default();
+        engine.voices[0] = Voice {
+            active: true,
+            event_id: 7,
+            unmixed_gain: 0.5,
+            source_increment: 1.0,
+            ..Voice::default()
+        };
+        engine.voices[1] = Voice {
+            active: true,
+            event_id: 8,
+            unmixed_gain: 0.5,
+            source_increment: 1.0,
+            ..Voice::default()
+        };
+        engine.execute_actions(
+            &[ScriptAction::ChangeEvent {
+                kind: "change_tune".into(),
+                id: 7,
+                value: 1_200_000,
+                relative: false,
+            }],
+            None,
+        );
+        engine.voices[0].sync_mix(&runtime.engine);
+        engine.voices[1].sync_mix(&runtime.engine);
+        assert!((engine.voices[0].increment - 4.0).abs() < 0.001);
+        assert!((engine.voices[1].increment - 2.0).abs() < 0.001);
+        assert!(engine.voices[0].gain_left.abs() < 1e-6);
+        assert!((engine.voices[0].gain_right - 1.0).abs() < 1e-6);
+        runtime.set_control_value(0, "mute", 0);
+        engine.voices[0].sync_mix(&runtime.engine);
+        assert_eq!(engine.voices[0].base_gain, 0.0);
+        assert!(engine.voices[0].active);
+    }
 
     #[test]
     fn ahdsr_reaches_sustain_then_releases() {
@@ -1619,9 +1878,11 @@ mod tests {
         let ksp = Arc::new(KspRuntime::compile_with_groups(&texts, &root, groups));
         ksp.initialize();
         let loaded = Arc::new(LoadedInstrument {
+            control_notices: HashMap::new(),
             instrument,
             ksp,
             samples: samples.samples,
+            explicit_velocity_fades: Vec::new(),
             diagnostics: Vec::new(),
             bytes_loaded: 0,
             bytes_mapped: 0,

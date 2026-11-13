@@ -177,7 +177,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// this corpus disagree on framing: a chunk is either `[u8 present][u16 id][u32 length]` or
 /// `[u32 size][u16 id][u32 length]`. `parse_ahdsr` is the filter — a wrong offset almost never
 /// yields a `0x10`/`0x11` version followed by plausible times.
-fn scan_ahdsr(bytes: &[u8], depth: usize) -> Option<Ahdsr> {
+pub(crate) fn scan_ahdsr(bytes: &[u8], depth: usize) -> Option<Ahdsr> {
     if depth > 6 {
         return None;
     }

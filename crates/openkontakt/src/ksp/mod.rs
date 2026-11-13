@@ -11,7 +11,7 @@ pub mod parser;
 
 use parser::{BinOp, Callback, Expr, Program, Stmt, UiDecl, UiKind, UnOp, VarKind};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------------------------
@@ -264,6 +264,16 @@ fn clean_label(name: &str) -> String {
 // Host: what a script can reach outside itself
 
 pub trait Host {
+    fn find_mod(&mut self, _group: i64, _name: &str) -> i64 {
+        -1
+    }
+    fn find_target(&mut self, _group: i64, _modulator: i64, _name: &str) -> i64 {
+        -1
+    }
+    fn random(&mut self, low: i64, _high: i64) -> i64 {
+        low
+    }
+    fn change_event(&mut self, _kind: &str, _id: i64, _value: i64, _relative: bool) {}
     /// Read an engine parameter. `None` means "this instrument has no such target", which KSP
     /// answers with 0.
     fn engine_par(&mut self, param: &str, group: i64, slot: i64, generic: i64) -> Option<i64>;
@@ -314,7 +324,16 @@ pub trait Host {
     // Event callbacks. A script that never calls these leaves the engine's defaults alone.
     fn allow_group(&mut self, _group: i64) {}
     fn disallow_group(&mut self, _group: i64) {}
-    fn play_note(&mut self, _note: i64, _velocity: i64, _offset: i64, _release: i64) {}
+    fn play_note(
+        &mut self,
+        _note: i64,
+        _velocity: i64,
+        _offset: i64,
+        _release: i64,
+        _parent: i64,
+    ) -> i64 {
+        0
+    }
     fn note_off_event(&mut self, _id: i64) {}
     /// `change_note`: retarget one event to another key.
     fn change_note(&mut self, _id: i64, _note: i64) {}
@@ -339,7 +358,15 @@ pub struct GroupInfo {
 /// A sound-producing request from a script.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScriptAction {
+    ChangeEvent {
+        kind: String,
+        id: i64,
+        value: i64,
+        relative: bool,
+    },
     PlayNote {
+        id: i64,
+        parent: i64,
         note: i64,
         velocity: i64,
         offset: i64,
@@ -383,8 +410,16 @@ pub struct EventContext {
 /// Volumes are stored as atomics so the realtime thread can read them without a lock; everything
 /// else is behind a mutex because only the GUI and background threads touch it.
 pub struct EngineState {
+    pub external_envelopes_enabled: bool,
+    pub modulation: Vec<crate::modulation::GroupModulation>,
+    diagnostics: Mutex<Vec<String>>,
+    next_script_event: AtomicU64,
+    random_state: AtomicU64,
+    pending_ui: Mutex<Vec<Dispatch>>,
     bus_gain: [AtomicU32; 16],
-    group_gain: [AtomicU32; 16],
+    group_gain: Vec<AtomicU32>,
+    group_pan: Vec<AtomicU32>,
+    group_tune: Vec<AtomicU32>,
     params: Mutex<HashMap<String, i64>>,
     pub messages: Mutex<Vec<String>>,
     /// Last `load_ir_sample` request: the impulse response the script wants convolved.
@@ -418,8 +453,20 @@ pub struct EngineState {
 impl Default for EngineState {
     fn default() -> Self {
         Self {
+            external_envelopes_enabled: false,
+            modulation: Vec::new(),
+            diagnostics: Mutex::new(Vec::new()),
+            next_script_event: AtomicU64::new(1 << 40),
+            random_state: AtomicU64::new(0x9e3779b97f4a7c15),
+            pending_ui: Mutex::new(Vec::new()),
             bus_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
-            group_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            group_gain: (0..16).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            group_pan: (0..16)
+                .map(|_| AtomicU32::new(f32::NAN.to_bits()))
+                .collect(),
+            group_tune: (0..16)
+                .map(|_| AtomicU32::new(f32::NAN.to_bits()))
+                .collect(),
             params: Mutex::new(HashMap::new()),
             messages: Mutex::new(Vec::new()),
             ir_request: Mutex::new(None),
@@ -438,6 +485,87 @@ impl Default for EngineState {
 }
 
 impl EngineState {
+    pub fn modulate_amp_envelope(&self, group: usize, mut envelope: crate::Ahdsr) -> crate::Ahdsr {
+        if !self.external_envelopes_enabled {
+            return envelope;
+        }
+        use crate::modulation::Source;
+        let Some(routes) = self.modulation.get(group) else {
+            return envelope;
+        };
+        let Some(amp) = routes.amp_slot() else {
+            return envelope;
+        };
+        let cc = self.cc.lock().map(|cc| *cc).unwrap_or([0; 128]);
+        let mut values = [
+            crate::envelope::ms_to_normalized(envelope.attack_ms),
+            crate::envelope::ms_to_normalized(envelope.decay_ms),
+            envelope.sustain,
+            crate::envelope::ms_to_normalized(envelope.release_ms),
+        ];
+        let mut changed = [false; 4];
+        for source in &routes.modulators {
+            let Source::Controller { number, .. } = &source.source else {
+                continue;
+            };
+            if *number >= 128 {
+                continue;
+            }
+            let input = cc[*number as usize];
+            for (index, target) in source.targets.iter().enumerate() {
+                if target.destination != Some(amp) {
+                    continue;
+                }
+                let field = match target.parameter.as_str() {
+                    "ahdsr_attack" => 0,
+                    "ahdsr_decay" => 1,
+                    "ahdsr_sustain" => 2,
+                    "ahdsr_release" => 3,
+                    _ => continue,
+                };
+                let amount = self
+                    .get_cached(
+                        "ENGINE_PAR_MOD_TARGET_INTENSITY",
+                        group as i64,
+                        source.handle,
+                        index as i64,
+                    )
+                    .or_else(|| {
+                        self.get_cached(
+                            "ENGINE_PAR_MOD_TARGET_INTENSITY",
+                            group as i64,
+                            source.handle,
+                            -1,
+                        )
+                    })
+                    .map(|v| v as f32 / 1_000_000.0)
+                    .unwrap_or(target.amount);
+                values[field] += amount * target.value(input.clamp(0, 127) as f32 / 127.0);
+                changed[field] = true;
+            }
+        }
+        if changed[0] {
+            envelope.attack_ms = crate::envelope::normalized_to_ms(values[0]);
+        }
+        if changed[1] {
+            envelope.decay_ms = crate::envelope::normalized_to_ms(values[1]);
+        }
+        if changed[2] {
+            envelope.sustain = values[2].clamp(0.0, 1.0);
+        }
+        if changed[3] {
+            envelope.release_ms = crate::envelope::normalized_to_ms(values[3]);
+        }
+        envelope
+    }
+    /// UI callbacks run outside the audio thread. Drain their sound-producing actions at a block
+    /// boundary, retaining their group routing rather than dropping `play_note`/`note_off` calls.
+    pub fn take_ui_dispatches(&self) -> Vec<Dispatch> {
+        self.pending_ui
+            .try_lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
     pub fn bus_gain(&self, bus: usize) -> f32 {
         self.bus_gain
             .get(bus)
@@ -452,13 +580,27 @@ impl EngineState {
             .unwrap_or(1.0)
     }
 
+    pub fn group_pan(&self, group: usize) -> Option<f32> {
+        self.group_pan
+            .get(group)
+            .map(|v| f32::from_bits(v.load(Ordering::Relaxed)))
+            .filter(|v| v.is_finite())
+    }
+
+    pub fn group_tune(&self, group: usize) -> Option<f32> {
+        self.group_tune
+            .get(group)
+            .map(|v| f32::from_bits(v.load(Ordering::Relaxed)))
+            .filter(|v| v.is_finite())
+    }
+
     fn set_bus_gain(&self, bus: usize, gain: f32) {
         if let Some(slot) = self.bus_gain.get(bus) {
             slot.store(gain.to_bits(), Ordering::Relaxed);
         }
     }
 
-    fn set_group_gain(&self, group: usize, gain: f32) {
+    pub fn set_group_gain(&self, group: usize, gain: f32) {
         if let Some(slot) = self.group_gain.get(group) {
             slot.store(gain.to_bits(), Ordering::Relaxed);
         }
@@ -662,6 +804,66 @@ pub struct EngineHost {
 }
 
 impl Host for EngineHost {
+    fn find_mod(&mut self, group: i64, name: &str) -> i64 {
+        let result = usize::try_from(group)
+            .ok()
+            .and_then(|g| self.state.modulation.get(g))
+            .and_then(|g| g.find(name))
+            .map(|m| m.handle);
+        if let Some(handle) = result {
+            return handle;
+        }
+        if let Ok(mut diagnostics) = self.state.diagnostics.lock() {
+            let key = format!("KSP: modulator `{name}` is absent");
+            if !diagnostics.iter().any(|d| d.starts_with(&key)) {
+                diagnostics.push(format!("{key} in group {group}"));
+            }
+        }
+        -1
+    }
+    fn find_target(&mut self, group: i64, modulator: i64, name: &str) -> i64 {
+        let Some(module) = usize::try_from(group)
+            .ok()
+            .and_then(|g| self.state.modulation.get(g))
+            .and_then(|g| g.by_handle(modulator))
+        else {
+            return -1;
+        };
+        module
+            .targets
+            .iter()
+            .position(|t| t.name == name)
+            .map(|i| i as i64)
+            .unwrap_or(-1)
+    }
+    fn diagnostic(&mut self, message: String) {
+        if let Ok(mut messages) = self.state.diagnostics.lock() {
+            if !messages.contains(&message) {
+                messages.push(message);
+            }
+        }
+    }
+    fn random(&mut self, low: i64, high: i64) -> i64 {
+        let (low, high) = (low.min(high), low.max(high));
+        let mut value = self
+            .state
+            .random_state
+            .fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^= value >> 31;
+        let width = high as i128 - low as i128 + 1;
+        (low as i128 + (value as u128 % width as u128) as i128) as i64
+    }
+
+    fn change_event(&mut self, kind: &str, id: i64, value: i64, relative: bool) {
+        self.actions.push(ScriptAction::ChangeEvent {
+            kind: kind.to_string(),
+            id,
+            value,
+            relative,
+        });
+    }
     fn set_controller(&mut self, number: i64, value: i64) {
         self.state.set_controller_from_script(number, value);
     }
@@ -677,6 +879,17 @@ impl Host for EngineHost {
     fn engine_par(&mut self, param: &str, group: i64, slot: i64, generic: i64) -> Option<i64> {
         if let Some(value) = self.state.get_cached(param, group, slot, generic) {
             return Some(value);
+        }
+        if param == "ENGINE_PAR_MOD_TARGET_INTENSITY" {
+            let module = self
+                .state
+                .modulation
+                .get(usize::try_from(group).ok()?)?
+                .by_handle(slot)?;
+            return module
+                .targets
+                .get(if generic < 0 { 0 } else { generic as usize })
+                .map(|t| (t.amount * 1_000_000.0).round() as i64);
         }
         if param == "ENGINE_PAR_RELEASE_TRIGGER" && group >= 0 {
             return Some(
@@ -726,8 +939,24 @@ impl Host for EngineHost {
     }
 
     fn set_engine_par(&mut self, param: &str, value: i64, group: i64, slot: i64, generic: i64) {
+        if param == "ENGINE_PAR_MOD_TARGET_INTENSITY" && slot < 0 {
+            return;
+        }
         self.state.put_cached(param, group, slot, generic, value);
         match param {
+            "ENGINE_PAR_PAN" if group >= 0 && generic < 1024 && slot <= 0 => {
+                if let Some(target) = self.state.group_pan.get(group as usize) {
+                    let pan = (value as f32 / 500_000.0 - 1.0).clamp(-1.0, 1.0);
+                    target.store(pan.to_bits(), Ordering::Relaxed);
+                }
+            }
+            "ENGINE_PAR_TUNE" if group >= 0 && generic < 1024 && slot <= 0 => {
+                if let Some(target) = self.state.group_tune.get(group as usize) {
+                    let tune =
+                        2f32.powf((value.clamp(0, 1_000_000) as f32 / 1_000_000.0 - 0.5) * 6.0);
+                    target.store(tune.to_bits(), Ordering::Relaxed);
+                }
+            }
             "ENGINE_PAR_VOLUME" => {
                 let gain = volume_to_gain(value);
                 if generic >= 1024 {
@@ -910,13 +1139,24 @@ impl Host for EngineHost {
         }
     }
 
-    fn play_note(&mut self, note: i64, velocity: i64, offset: i64, release: i64) {
+    fn play_note(
+        &mut self,
+        note: i64,
+        velocity: i64,
+        offset: i64,
+        release: i64,
+        parent: i64,
+    ) -> i64 {
+        let id = self.state.next_script_event.fetch_add(1, Ordering::Relaxed) as i64;
         self.actions.push(ScriptAction::PlayNote {
+            id,
+            parent,
             note,
             velocity,
             offset,
             release,
         });
+        id
     }
 
     fn note_off_event(&mut self, id: i64) {
@@ -1209,7 +1449,9 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            return result.map(|_| Value::Int(0));
+            return result
+                .map(|_| Value::Int(0))
+                .map_err(|e| format!("{name}: {e}"));
         }
 
         let symbol_arg = |index: usize| -> Option<String> {
@@ -1220,6 +1462,18 @@ impl<'a> Interp<'a> {
         };
 
         match lower.as_str() {
+            "random" => {
+                let low = self.eval_arg(args, 0)?;
+                let high = self.eval_arg(args, 1)?;
+                Ok(Value::Int(self.host.random(low, high)))
+            }
+            "change_vol" | "change_tune" | "change_pan" => {
+                let id = self.eval_arg(args, 0)?;
+                let value = self.eval_arg(args, 1)?;
+                let relative = self.eval_arg(args, 2)? != 0;
+                self.host.change_event(&lower, id, value, relative);
+                Ok(Value::Int(0))
+            }
             "inc" | "dec" => {
                 let step = if lower == "inc" { 1 } else { -1 };
                 if let Some(Expr::Var(_, name)) = args.first() {
@@ -1242,12 +1496,15 @@ impl<'a> Interp<'a> {
                 Ok(Value::Int(0))
             }
             "find_mod" => {
-                // Kontakt looks up a modulator by type and engine name. No modulator data is
-                // stored anywhere this reader parses — one library's `LFO_SINE` modulator
-                // does not exist in its file — so nothing can be found and -1 is the answer the
-                // script has to cope with. Without this the unknown-function fallback returned 0,
-                // which pointed every `set_engine_par(..., find_mod(...), ...)` at slot 0.
-                Ok(Value::Int(-1))
+                let group = self.eval_arg(args, 0)?;
+                let name = self.eval_arg_str(args, 1)?;
+                Ok(Value::Int(self.host.find_mod(group, &name)))
+            }
+            "find_target" => {
+                let group = self.eval_arg(args, 0)?;
+                let module = self.eval_arg(args, 1)?;
+                let name = self.eval_arg_str(args, 2)?;
+                Ok(Value::Int(self.host.find_target(group, module, &name)))
             }
             "get_engine_par" => {
                 let param = symbol_arg(0).unwrap_or_default();
@@ -1430,6 +1687,19 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Int(0))
             }
+            "set_menu_item_str" => {
+                let id = self.control_arg(args)?;
+                let row = self.eval_arg(args, 1)?;
+                let text = self.eval_arg_str(args, 2)?;
+                if let Some(item) = id.and_then(|id| self.ui.get_mut(id)).and_then(|control| {
+                    usize::try_from(row)
+                        .ok()
+                        .and_then(|row| control.menu.get_mut(row))
+                }) {
+                    *item = text;
+                }
+                Ok(Value::Int(0))
+            }
             "add_menu_item" => {
                 let name = symbol_arg(0).unwrap_or_default();
                 let text = self.eval_arg_str(args, 1)?;
@@ -1461,8 +1731,10 @@ impl<'a> Interp<'a> {
                 let velocity = self.eval_arg(args, 1)?;
                 let offset = self.eval_arg(args, 2)?;
                 let release = self.eval_arg(args, 3)?;
-                self.host.play_note(note, velocity, offset, release);
-                Ok(Value::Int(0))
+                let parent = self.vars.get("EVENT_ID").as_int();
+                Ok(Value::Int(
+                    self.host.play_note(note, velocity, offset, release, parent),
+                ))
             }
             "note_off" => {
                 let id = self.eval_arg(args, 0)?;
@@ -1550,8 +1822,16 @@ impl<'a> Interp<'a> {
                 self.host.panel_height(rows * 21.0 + 2.0);
                 Ok(Value::Int(0))
             }
-            "set_ui_width_px" | "make_perfview" | "watch_var" | "change_vol" | "change_tune"
-            | "fade_out" | "set_event_par_arr" | "message" | "exit" => {
+            "set_ui_width_px"
+            | "make_perfview"
+            | "watch_var"
+            | "read_persistent_var"
+            | "_read_persistent_var"
+            | "set_listener"
+            | "fade_out"
+            | "set_event_par_arr"
+            | "message"
+            | "exit" => {
                 if lower == "message" {
                     let text = self.eval_arg_str(args, 0)?;
                     self.host.message(&text);
@@ -1566,7 +1846,7 @@ impl<'a> Interp<'a> {
                 self.timer_ms = self.timer_ms.saturating_add(ms.max(1));
                 Ok(Value::Int(0))
             }
-            "load_ir_sample" => {
+            "load_ir_sample" | "_load_ir_sample" => {
                 let path = self.eval_arg_str(args, 0)?;
                 let slot = self.eval_arg(args, 1)?;
                 let generic = self.eval_arg(args, 2)?;
@@ -1579,25 +1859,25 @@ impl<'a> Interp<'a> {
                 Ok(Value::Str(self.host.folder(&kind)))
             }
             "pgs_create_key" => {
-                let key = self.eval_arg_str(args, 0)?;
+                let key = self.eval_pgs_key(args)?;
                 let size = self.eval_arg(args, 1)?;
                 self.host.pgs_create(&key, size);
                 Ok(Value::Int(0))
             }
             "pgs_set_key_val" => {
-                let key = self.eval_arg_str(args, 0)?;
+                let key = self.eval_pgs_key(args)?;
                 let index = self.eval_arg(args, 1)?;
                 let value = self.eval_arg(args, 2)?;
                 self.host.pgs_set(&key, index, value);
                 Ok(Value::Int(0))
             }
             "pgs_get_key_val" => {
-                let key = self.eval_arg_str(args, 0)?;
+                let key = self.eval_pgs_key(args)?;
                 let index = self.eval_arg(args, 1)?;
                 Ok(Value::Int(self.host.pgs_get(&key, index)))
             }
             "pgs_key_exists" => {
-                let key = self.eval_arg_str(args, 0)?;
+                let key = self.eval_pgs_key(args)?;
                 Ok(Value::Int(self.host.pgs_exists(&key) as i64))
             }
             "event_status" => Ok(Value::Int(0)),
@@ -1683,6 +1963,15 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// PGS keys are symbolic names. The parser represents a bare name as a zero-argument call;
+    /// evaluating that unknown call as a number aliases every key to the string "0".
+    fn eval_pgs_key(&mut self, args: &[Expr]) -> Result<String, String> {
+        match args.first() {
+            Some(Expr::Call(name, arguments)) if arguments.is_empty() => Ok(name.clone()),
+            _ => self.eval_arg_str(args, 0),
+        }
+    }
+
     fn eval_arg_str(&mut self, args: &[Expr], index: usize) -> Result<String, String> {
         match args.get(index) {
             Some(expr) => Ok(self.eval(expr)?.as_str()),
@@ -1743,6 +2032,11 @@ fn binary(op: BinOp, left: Value, right: Value) -> Value {
 /// other microphones default to 0.
 fn volume_to_gain(value: i64) -> f32 {
     let value = value.clamp(0, 1_000_000) as f32 / 1_000_000.0;
+    // Alternative law for controlled differential renders; retain the established default until
+    // host level, saved mixer state and parameter mapping can be measured independently.
+    if std::env::var("OPENKONTAKT_VOLUME_LAW").as_deref() == Ok("linear") {
+        return value;
+    }
     if value <= 0.0 {
         return 0.0;
     }
@@ -1909,6 +2203,8 @@ struct SlotState {
 
 /// Per-slot script state plus the engine parameters the scripts drive.
 pub struct KspRuntime {
+    restoring: AtomicBool,
+    deferred_ui: Mutex<Vec<Dispatch>>,
     slots: Vec<Mutex<SlotState>>,
     pub engine: Arc<EngineState>,
     root: String,
@@ -1916,6 +2212,33 @@ pub struct KspRuntime {
 }
 
 impl KspRuntime {
+    pub fn compile_instrument(
+        texts: &[Option<String>],
+        root: &str,
+        groups: &[crate::group::Group],
+    ) -> Self {
+        let info = groups
+            .iter()
+            .map(|g| GroupInfo {
+                release_trigger: g.release_trigger,
+                envelope: crate::envelope::group_amp_envelope(g),
+            })
+            .collect();
+        let mut runtime = Self::compile_with_groups(texts, root, info);
+        let state = Arc::get_mut(&mut runtime.engine).expect("new runtime owns engine state");
+        state.external_envelopes_enabled =
+            std::env::var("OPENKONTAKT_EXTERNAL_ENVELOPES").as_deref() == Ok("1");
+        state.modulation = groups
+            .iter()
+            .map(crate::modulation::group_modulation)
+            .collect();
+        for group in &state.modulation {
+            if let Ok(mut diagnostics) = state.diagnostics.lock() {
+                diagnostics.extend(group.diagnostics.iter().cloned());
+            }
+        }
+        runtime
+    }
     /// Compile every slot. Slots that fail to parse are recorded and skipped.
     pub fn compile(texts: &[Option<String>], root: &str) -> Self {
         Self::compile_with_groups(texts, root, Vec::new())
@@ -1942,7 +2265,20 @@ impl KspRuntime {
         }
         Self {
             slots,
-            engine: Arc::new(EngineState::default()),
+            restoring: AtomicBool::new(false),
+            deferred_ui: Mutex::new(Vec::new()),
+            engine: Arc::new(EngineState {
+                group_gain: (0..groups.len().max(16))
+                    .map(|_| AtomicU32::new(1.0f32.to_bits()))
+                    .collect(),
+                group_pan: (0..groups.len().max(16))
+                    .map(|_| AtomicU32::new(f32::NAN.to_bits()))
+                    .collect(),
+                group_tune: (0..groups.len().max(16))
+                    .map(|_| AtomicU32::new(f32::NAN.to_bits()))
+                    .collect(),
+                ..EngineState::default()
+            }),
             root: root.to_string(),
             groups: Arc::new(groups),
         }
@@ -1956,6 +2292,24 @@ impl KspRuntime {
     pub fn initialize(&self) {
         for index in 0..self.slots.len() {
             self.run_init(index);
+        }
+    }
+
+    /// Restore all slots before delivering cross-slot notifications. A receiver must not react to
+    /// the saved UI with its unrestored init defaults (which may enable a long-running callback).
+    pub fn apply_persistent_batch(&self, slots: &[(usize, Vec<(String, Vec<i64>)>)]) {
+        self.restoring.store(true, Ordering::Relaxed);
+        for (slot, entries) in slots {
+            self.apply_persistent(*slot, entries);
+        }
+        self.restoring.store(false, Ordering::Relaxed);
+        let pending = self
+            .deferred_ui
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default();
+        for dispatch in pending {
+            self.finish_ui_dispatch(dispatch);
         }
     }
 
@@ -2084,58 +2438,53 @@ impl KspRuntime {
         }
         state.vars = interp.vars;
         state.ui = interp.ui;
+        drop(state);
+        self.finish_ui_callback(host);
     }
 
     /// A control moved in the GUI: store the value and run its `on ui_control` callback.
     pub fn set_control_normalized(&self, index: usize, control: &str, normalized: f32) -> bool {
-        let Ok(mut state) = self.slots[index].lock() else {
-            return false;
+        let value = {
+            let Some(slot) = self.slots.get(index) else {
+                return false;
+            };
+            let Ok(mut state) = slot.lock() else {
+                return false;
+            };
+            let Some(ui) = state.ui.iter_mut().find(|c| c.name == bare(control)) else {
+                return false;
+            };
+            ui.set_normalized(normalized);
+            ui.value
         };
-        let value = match state.ui.iter_mut().find(|c| c.name == bare(control)) {
-            Some(ui) => {
-                ui.set_normalized(normalized);
-                ui.value
+        self.set_control_value(index, control, value)
+    }
+
+    fn finish_ui_callback(&self, host: EngineHost) {
+        let result = Dispatch {
+            allowed_groups: host.allowed,
+            actions: host.actions,
+            ignore_event: host.ignored,
+            pgs_changed: host.pgs_changed,
+        };
+        if self.restoring.load(Ordering::Relaxed) {
+            if let Ok(mut pending) = self.deferred_ui.lock() {
+                pending.push(result);
             }
-            None => return false,
-        };
-        let Some(program) = state.program.clone() else {
-            return false;
-        };
-        state
-            .vars
-            .set(control.trim_start_matches('$'), Value::Int(value));
-        let callbacks: Vec<Callback> = program
-            .callbacks
-            .iter()
-            .filter(|c| c.kind == "ui_control" && c.arg.as_deref().map(bare) == Some(bare(control)))
-            .cloned()
-            .collect();
-        let mut host = EngineHost {
-            slot: index,
-            state: Arc::clone(&self.engine),
-            root: self.root.clone(),
-            groups: Arc::clone(&self.groups),
-            allowed: None,
-            actions: Vec::new(),
-            ignored: false,
-            pgs_changed: Vec::new(),
-        };
-        let mut interp = Interp::new(&program, &mut host);
-        interp.vars = std::mem::take(&mut state.vars);
-        interp.ui = std::mem::take(&mut state.ui);
-        self.install_builtins(&mut interp);
-        let mut ok = true;
-        for callback in callbacks {
-            if let Err(error) = interp.run(&callback.body) {
-                state
-                    .diagnostics
-                    .push(format!("KSP on ui_control({control}): {error}"));
-                ok = false;
+            return;
+        }
+        self.finish_ui_dispatch(result);
+    }
+
+    fn finish_ui_dispatch(&self, mut result: Dispatch) {
+        for key in std::mem::take(&mut result.pgs_changed) {
+            self.dispatch_pgs_changed(&key, 0, &mut result);
+        }
+        if !result.actions.is_empty() {
+            if let Ok(mut pending) = self.engine.pending_ui.lock() {
+                pending.push(result);
             }
         }
-        state.vars = interp.vars;
-        state.ui = interp.ui;
-        ok
     }
 
     fn cc_snapshot(&self) -> Vec<Value> {
@@ -2218,6 +2567,14 @@ impl KspRuntime {
     pub fn variable(&self, index: usize, name: &str) -> Option<i64> {
         let state = self.slots.get(index)?.lock().ok()?;
         Some(state.vars.get(bare(name)).as_int())
+    }
+
+    pub fn array_variable(&self, index: usize, name: &str) -> Option<Vec<i64>> {
+        let state = self.slots.get(index)?.lock().ok()?;
+        match state.vars.vars.get(name)? {
+            Variable::Array(values) => Some(values.iter().map(Value::as_int).collect()),
+            _ => None,
+        }
     }
 
     /// How often a slot's `on listener` should run: the interval the script asked for, or the
@@ -2391,7 +2748,7 @@ impl KspRuntime {
                 if let Err(error) = interp.run(&callback.body) {
                     state
                         .diagnostics
-                        .push(format!("KSP on pgs_changed: {error}"));
+                        .push(format!("KSP slot {slot} on pgs_changed({key}): {error}"));
                     break;
                 }
             }
@@ -2453,6 +2810,8 @@ impl KspRuntime {
         }
         state.vars = interp.vars;
         state.ui = interp.ui;
+        drop(state);
+        self.finish_ui_callback(host);
         ok
     }
 
@@ -2475,6 +2834,7 @@ impl KspRuntime {
         if let Some(step) = ui.table.get_mut(element) {
             *step = value;
         }
+        let stored = ui.value;
         // A `ui_table` is bound to an array, and arrays live under their `%` name.
         let array = format!("%{}", bare(control));
         let name = if state.vars.vars.contains_key(&array) {
@@ -2482,10 +2842,15 @@ impl KspRuntime {
         } else {
             bare(control).to_string()
         };
+        if !matches!(state.vars.vars.get(&name), Some(Variable::Array(values)) if element < values.len())
+        {
+            return false;
+        }
         state
             .vars
             .set_index(&name, element as i64, Value::Int(value));
-        true
+        drop(state);
+        self.set_control_value(index, control, stored)
     }
 
     /// Snapshot of every slot's controls, for the GUI.
@@ -2525,6 +2890,9 @@ impl KspRuntime {
                 }
             }
         }
+        if let Ok(messages) = self.engine.diagnostics.lock() {
+            out.extend(messages.iter().cloned());
+        }
         out
     }
 
@@ -2540,6 +2908,269 @@ impl KspRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_controller_routes_are_addressed_and_experimental_envelopes_are_opt_in() {
+        use crate::modulation::{
+            Curve, CurvePoint, EXTERNAL_HANDLE, GroupModulation, Modulator, Source, Target,
+        };
+        let base = crate::Ahdsr {
+            attack_ms: 400.0,
+            ..crate::Ahdsr::default()
+        };
+        let volume = Target {
+            parameter: "volume".into(),
+            name: "AMP".into(),
+            destination: None,
+            amount: 1.0,
+            inverted: false,
+            curve: None,
+        };
+        let target = Target {
+            parameter: "ahdsr_attack".into(),
+            name: "TARGET".into(),
+            destination: Some(0),
+            amount: 0.1,
+            inverted: false,
+            curve: Some(Curve {
+                bipolar: true,
+                points: vec![
+                    CurvePoint {
+                        x: 0.0,
+                        y: 0.0,
+                        shape: 0.0,
+                    },
+                    CurvePoint {
+                        x: 1.0,
+                        y: 1.0,
+                        shape: 0.0,
+                    },
+                ],
+            }),
+        };
+        let mut runtime = KspRuntime::compile(
+            &[Some(
+                r#"
+        on init
+          declare $module := find_mod(0,"SOURCE")
+          declare $target := find_target(0,$module,"TARGET")
+          declare ui_knob $depth(0,1000000,1)
+        end on
+        on ui_control($depth)
+          set_engine_par($ENGINE_PAR_MOD_TARGET_INTENSITY,$depth,0,$module,$target)
+        end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        Arc::get_mut(&mut runtime.engine).unwrap().modulation = vec![GroupModulation {
+            modulators: vec![
+                Modulator {
+                    handle: 0,
+                    name: "AMPLIFIER".into(),
+                    targets: vec![volume],
+                    source: Source::Internal,
+                    envelope: Some(base),
+                },
+                Modulator {
+                    handle: EXTERNAL_HANDLE,
+                    name: "SOURCE".into(),
+                    targets: vec![target],
+                    source: Source::Controller {
+                        number: 84,
+                        raw_assignment: [0; 4],
+                    },
+                    envelope: None,
+                },
+            ],
+            diagnostics: vec![],
+        }];
+        runtime.initialize();
+        assert_eq!(runtime.variable(0, "module"), Some(EXTERNAL_HANDLE));
+        assert_eq!(runtime.variable(0, "target"), Some(0));
+        runtime.controller(84, 127);
+        assert_eq!(runtime.engine.modulate_amp_envelope(0, base), base);
+        Arc::get_mut(&mut runtime.engine)
+            .unwrap()
+            .external_envelopes_enabled = true;
+        let high = runtime.engine.modulate_amp_envelope(0, base).attack_ms;
+        runtime.controller(84, 0);
+        let low = runtime.engine.modulate_amp_envelope(0, base).attack_ms;
+        assert!(high > base.attack_ms && low < base.attack_ms);
+        runtime.set_control_value(0, "depth", 0);
+        assert!(
+            (runtime.engine.modulate_amp_envelope(0, base).attack_ms - base.attack_ms).abs() < 0.01
+        );
+    }
+
+    #[test]
+    fn ui_notifications_reach_other_slots_for_raw_normalized_and_restored_controls() {
+        let writer = r#"
+        on init
+          declare ui_knob $amount(0,1000000,1)
+          pgs_create_key(LEVEL,1)
+        end on
+        on ui_control($amount)
+          pgs_set_key_val(LEVEL,0,$amount)
+        end on
+        "#;
+        let reader = r#"
+        on pgs_changed
+          set_engine_par($ENGINE_PAR_GAIN1,pgs_get_key_val(LEVEL,0),-1,0,-1)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(writer.into()), Some(reader.into())], "");
+        runtime.initialize();
+        assert!(runtime.set_control_value(0, "amount", 750000));
+        assert_eq!(
+            runtime.engine.get_cached("ENGINE_PAR_GAIN1", -1, 0, -1),
+            Some(750000)
+        );
+        assert!(runtime.set_control_normalized(0, "amount", 0.25));
+        assert_eq!(
+            runtime.engine.get_cached("ENGINE_PAR_GAIN1", -1, 0, -1),
+            Some(250000)
+        );
+        runtime.apply_persistent_batch(&[(0, vec![("amount".into(), vec![500000])])]);
+        assert_eq!(
+            runtime.engine.get_cached("ENGINE_PAR_GAIN1", -1, 0, -1),
+            Some(500000)
+        );
+    }
+
+    #[test]
+    fn restore_batch_notifies_receivers_after_their_saved_values_are_restored() {
+        let runtime = KspRuntime::compile(
+            &[
+                Some(
+                    r#"
+        on init
+          declare ui_button $send
+          pgs_create_key(READY,1)
+        end on
+        on ui_control($send)
+          pgs_set_key_val(READY,0,1)
+        end on
+        "#
+                    .into(),
+                ),
+                Some(
+                    r#"
+        on init
+          declare $mode := 1
+          declare $seen := -1
+        end on
+        on pgs_changed
+          $seen := $mode
+        end on
+        "#
+                    .into(),
+                ),
+            ],
+            "",
+        );
+        runtime.initialize();
+        runtime.apply_persistent_batch(&[
+            (0, vec![("send".into(), vec![1])]),
+            (1, vec![("mode".into(), vec![0])]),
+        ]);
+        assert_eq!(runtime.variable(1, "seen"), Some(0));
+    }
+
+    #[test]
+    fn ui_played_notes_keep_unique_ids_and_event_changes() {
+        let runtime = KspRuntime::compile(
+            &[Some(
+                r#"
+        on init
+          declare ui_button $trigger
+          declare $id
+        end on
+        on ui_control($trigger)
+          $id := play_note(60,100,0,250000)
+          change_tune($id,1200000,0)
+          change_pan($id,-1000,0)
+        end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        runtime.set_control_value(0, "trigger", 1);
+        let first = runtime.variable(0, "id").unwrap();
+        runtime.set_control_value(0, "trigger", 0);
+        let second = runtime.variable(0, "id").unwrap();
+        assert!(first > 0 && second > first);
+        let pending = runtime.engine.take_ui_dispatches();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            matches!(pending[0].actions[0],ScriptAction::PlayNote {id,release:250000,..} if id==first)
+        );
+        assert!(
+            matches!(&pending[0].actions[1],ScriptAction::ChangeEvent {kind,id,value:1200000,relative:false} if kind=="change_tune" && *id==first)
+        );
+        assert!(runtime.engine.take_ui_dispatches().is_empty());
+    }
+
+    #[test]
+    fn table_edits_run_the_table_callback() {
+        let runtime = KspRuntime::compile(
+            &[Some(
+                r#"
+        on init
+          declare ui_table %steps[3](1,1,100)
+          declare $seen
+        end on
+        on ui_control(%steps)
+          $seen := %steps[1]
+        end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        assert!(runtime.set_table_element(0, "steps", 1, 73));
+        assert_eq!(runtime.variable(0, "seen"), Some(73));
+        assert!(!runtime.set_table_element(0, "steps", 3, 99));
+    }
+
+    #[test]
+    fn random_is_inclusive_and_menu_rows_can_be_relabelled() {
+        let runtime = KspRuntime::compile(
+            &[Some(
+                r#"
+        on init
+          declare $i
+          declare $x
+          declare $lowest := 100
+          declare $highest := -100
+          declare ui_menu $menu
+          add_menu_item($menu,"before",0)
+          set_menu_item_str(get_ui_id($menu),0,"after")
+          while ($i < 100)
+            $x := random(-3,3)
+            if ($x < $lowest)
+              $lowest := $x
+            end if
+            if ($x > $highest)
+              $highest := $x
+            end if
+            inc($i)
+          end while
+        end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        assert_eq!(runtime.variable(0, "lowest"), Some(-3));
+        assert_eq!(runtime.variable(0, "highest"), Some(3));
+        assert_eq!(runtime.controls(0)[0].menu, vec!["after"]);
+    }
 
     struct TestHost {
         pub sets: Vec<(String, i64, i64, i64, i64)>,
@@ -3065,6 +3696,55 @@ mod tests {
         // A different controller number must not move it.
         runtime.controller(1, 0);
         assert!((runtime.engine.bus_gain(5) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pgs_symbolic_keys_keep_independent_values_and_sizes() {
+        let text = r#"
+        on init
+          declare $first
+          declare $second
+          declare $missing
+          pgs_create_key(COUNTER, 2)
+          pgs_create_key(LEVEL, 1)
+          pgs_set_key_val(COUNTER, 0, 11)
+          pgs_set_key_val(COUNTER, 1, 12)
+          pgs_set_key_val(LEVEL, 0, 99)
+          $first := pgs_get_key_val(COUNTER, 1)
+          $second := pgs_get_key_val(LEVEL, 0)
+          $missing := pgs_key_exists(UNCREATED)
+        end on
+        "#;
+        let runtime = KspRuntime::compile(&[Some(text.to_string())], "");
+        runtime.initialize();
+        assert_eq!(runtime.variable(0, "first"), Some(12));
+        assert_eq!(runtime.variable(0, "second"), Some(99));
+        assert_eq!(runtime.variable(0, "missing"), Some(0));
+    }
+
+    #[test]
+    fn script_can_mute_a_group_beyond_the_bus_count() {
+        let groups = (0..200)
+            .map(|_| GroupInfo {
+                release_trigger: false,
+                envelope: None,
+            })
+            .collect();
+        let runtime = KspRuntime::compile_with_groups(
+            &[Some(
+                r#"
+        on init
+          set_engine_par($ENGINE_PAR_VOLUME, 0, 160, -1, -1)
+        end on
+        "#
+                .to_string(),
+            )],
+            "",
+            groups,
+        );
+        runtime.initialize();
+        assert_eq!(runtime.engine.group_gain(160), 0.0);
+        assert_eq!(runtime.engine.group_gain(159), 1.0);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use openkontakt::{load_samples, Instrument};
+use openkontakt::{Instrument, load_samples};
 use std::path::PathBuf;
 
 /// Put the saved values into the runtime before anything reads it.
@@ -414,14 +414,16 @@ fn main() {
                     for (line, chunk) in body.chunks(16).enumerate() {
                         let text: String = chunk
                             .iter()
-                            .map(|b| if (32..127).contains(b) { *b as char } else { '.' })
+                            .map(|b| {
+                                if (32..127).contains(b) {
+                                    *b as char
+                                } else {
+                                    '.'
+                                }
+                            })
                             .collect();
                         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
-                        println!(
-                            "  {:4}  {:<47} {text}",
-                            line * 16,
-                            hex.join(" ")
-                        );
+                        println!("  {:4}  {:<47} {text}", line * 16, hex.join(" "));
                     }
                 }
             }

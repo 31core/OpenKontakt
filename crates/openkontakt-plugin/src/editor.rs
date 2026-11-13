@@ -10,7 +10,7 @@ use nice_plug::prelude::ParamSetter;
 use nice_plug::prelude::{FloatParam, Param};
 use nice_plug_egui::NiceEguiApp;
 use openkontakt::ksp::{
-    KeyColours, KEY_COLOR_BLACK, KEY_COLOR_DEFAULT, KEY_COLOR_INACTIVE, KEY_COLOR_WHITE,
+    KEY_COLOR_BLACK, KEY_COLOR_DEFAULT, KEY_COLOR_INACTIVE, KEY_COLOR_WHITE, KeyColours,
 };
 use openkontakt::{KspControl, KspControlKind};
 use std::collections::HashMap;
@@ -2053,6 +2053,33 @@ impl OpenKontaktEditor {
                         .map(|(_, value)| *value)
                         .unwrap_or_else(|| control.normalized_value());
                     self.draw_ksp_control(p, control, rect, ksp_scale);
+                    if let Some(notice) = self
+                        .ksp_slots
+                        .iter()
+                        .find(|(name, _)| name == &control.name)
+                        .and_then(|(_, slot)| {
+                            loaded
+                                .control_notices
+                                .get(&(*slot, control.name.trim_start_matches('$').to_string()))
+                        })
+                    {
+                        p.ui.painter()
+                            .rect_filled(rect, 2.0, Color32::from_black_alpha(130));
+                        p.ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            "N/A",
+                            FontId::proportional((10.0 * ksp_scale).max(9.0)),
+                            Color32::WHITE,
+                        );
+                        p.ui.interact(
+                            rect,
+                            p.ui.scope_id().with(("unavailable", &control.name)),
+                            Sense::hover(),
+                        )
+                        .on_hover_text(notice);
+                        continue;
+                    }
                     let draggable = matches!(
                         control.kind,
                         KspControlKind::Knob
@@ -2096,11 +2123,7 @@ impl OpenKontaktEditor {
                             // A button is momentary (the script decides what stays on, which is how
                             // radio groups are built); a switch toggles.
                             let value = if matches!(control.kind, KspControlKind::Button) {
-                                if control.value == 1 {
-                                    0
-                                } else {
-                                    1
-                                }
+                                if control.value == 1 { 0 } else { 1 }
                             } else {
                                 if control.value == 0 {
                                     control.max.max(1)

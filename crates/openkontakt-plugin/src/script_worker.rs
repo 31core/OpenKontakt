@@ -522,4 +522,3 @@ mod tests {
         assert!(left.len() <= (rate * MAX_IR_SECONDS) as usize);
     }
 }
-

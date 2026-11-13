@@ -2,7 +2,7 @@
 //!
 //! Racks and slots are parsed in the core crate; this module turns the modules we implement into
 //! per-sample processors and keeps their state. Every parameter is read once when the instrument
-//! loads, so an effect never allocates or parses while audio is running.
+//! loads; supported live parameters retune their existing processors at block boundaries.
 //!
 //! The parameter blocks are raw floats in native read order; `docs/format.md` §3.7 covers the rack
 //! and slot framing, and the per-module parameter layouts are undocumented.
@@ -13,32 +13,73 @@ use openkontakt::dsp::{Biquad, MAX_CHANNELS};
 use openkontakt::effects::{EffectSlot, ModuleParams, decode};
 
 pub struct Fx {
+    slot_index: usize,
     unit: Unit,
     gain: f32,
 }
 
 impl Fx {
+    /// Update addressed EQ bands without rebuilding the rack or resetting filter history.
+    pub fn sync_parameters(&mut self, state: &openkontakt::ksp::EngineState) {
+        if let Unit::Filter(filter) = &mut self.unit {
+            let parameter = |name| {
+                state
+                    .get_cached(name, -1, self.slot_index as i64, -1)
+                    .or_else(|| state.get_cached(name, -1, self.slot_index as i64, 0))
+            };
+            if let Some(value) = parameter("ENGINE_PAR_CUTOFF") {
+                filter.set_cutoff(cutoff_hz(value as f32 / 1_000_000.0));
+            }
+            if let Some(value) = parameter("ENGINE_PAR_RESONANCE") {
+                filter.set_resonance(value as f32 / 1_000_000.0);
+            }
+        }
+        if let Unit::Delay(delay) = &mut self.unit {
+            let parameter = |name| state.get_cached(name, -1, self.slot_index as i64, 1);
+            if let Some(value) = parameter("ENGINE_PAR_INSERT_EFFECT_OUTPUT_GAIN") {
+                self.gain = (value as f32 / 1_000_000.0).clamp(0.0, 1.0);
+            }
+            if let Some(value) = parameter("ENGINE_PAR_DL_FEEDBACK") {
+                delay.feedback = (value as f32 / 1_000_000.0).clamp(0.0, 0.99);
+            }
+            if let Some(value) = parameter("ENGINE_PAR_DL_PAN") {
+                delay.pan = (value as f32 / 500_000.0 - 1.0).clamp(-1.0, 1.0);
+            }
+        }
+        let Unit::Equalizer(eq) = &mut self.unit else {
+            return;
+        };
+        for (i, filter) in eq.iter_mut().enumerate() {
+            let parameter = |name: &str| {
+                state
+                    .get_cached(name, -1, self.slot_index as i64, -1)
+                    .or_else(|| state.get_cached(name, -1, self.slot_index as i64, 0))
+            };
+            if let Some(gain) = parameter(&format!("ENGINE_PAR_GAIN{}", i + 1)) {
+                filter.set_gain_db((gain as f32 / 1_000_000.0 - 0.5) * 36.0);
+            }
+            if let Some(freq) = parameter(&format!("ENGINE_PAR_FREQ{}", i + 1)) {
+                filter.set_cutoff(cutoff_hz(freq as f32 / 1_000_000.0));
+            }
+        }
+    }
     pub fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let parallel = matches!(self.unit, Unit::Delay(_));
         let (mut l, mut r) = self.unit.process(left, right);
         l *= self.gain;
         r *= self.gain;
-        (l, r)
-    }
-
-    /// Retune a filter from a normalised 0..1 knob, if this unit is one.
-    pub fn retune_filter(&mut self, normalized: f32, resonance: f32) {
-        if let Unit::Filter(filter) = &mut self.unit {
-            filter.set_cutoff(cutoff_hz(normalized));
-            filter.set_resonance(resonance);
+        // Delay is a wet return. Closing its output must retain the dry instrument, not mute
+        // the entire insert chain (the stored wet gain can be zero even with bypass disabled).
+        if parallel {
+            l += left;
+            r += right;
         }
-    }
-
-    pub fn is_filter(&self) -> bool {
-        matches!(self.unit, Unit::Filter(_))
+        (l, r)
     }
 }
 
 enum Unit {
+    Equalizer([Biquad; 3]),
     Pass,
     Gainer,
     Filter(Biquad),
@@ -51,6 +92,14 @@ enum Unit {
 impl Unit {
     fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         match self {
+            Unit::Equalizer(eq) => {
+                let (mut l, mut r) = (left, right);
+                for filter in eq {
+                    l = filter.process(0, l);
+                    r = filter.process(1, r);
+                }
+                (l, r)
+            }
             Unit::Pass => (left, right),
             Unit::Gainer => (left, right),
             Unit::Filter(filter) => (filter.process(0, left), filter.process(1, right)),
@@ -87,7 +136,11 @@ impl Compressor {
 
     fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         let level = left.abs().max(right.abs());
-        let coefficient = if level > self.envelope { self.attack } else { self.release };
+        let coefficient = if level > self.envelope {
+            self.attack
+        } else {
+            self.release
+        };
         self.envelope = coefficient * self.envelope + (1.0 - coefficient) * level;
         if self.envelope <= self.threshold || self.envelope <= 1e-9 {
             return (left, right);
@@ -169,8 +222,14 @@ pub fn build_chain(
             continue;
         }
         let unit = match decode(slot) {
+            ModuleParams::Equalizer { bands } => Unit::Equalizer(std::array::from_fn(|i| {
+                let [frequency, q, gain] = bands[i];
+                let resonance = ((q / 0.5).ln() / 40f32.ln()).clamp(0.0, 1.0);
+                Biquad::peak(sample_rate, frequency, resonance, gain)
+            })),
             ModuleParams::Gainer { gain } => {
                 let mut fx = Fx {
+                    slot_index: index,
                     unit: Unit::Gainer,
                     gain: gain.clamp(0.0, 8.0),
                 };
@@ -180,6 +239,9 @@ pub fn build_chain(
             }
             ModuleParams::Filter { cutoff, resonance } => {
                 Unit::Filter(Biquad::low_pass(sample_rate, cutoff_hz(cutoff), resonance))
+            }
+            ModuleParams::HighPass { cutoff, resonance } => {
+                Unit::Filter(Biquad::high_pass(sample_rate, cutoff_hz(cutoff), resonance))
             }
             ModuleParams::Distortion {
                 drive,
@@ -191,6 +253,7 @@ pub fn build_chain(
                 // library) put this player far below Kontakt, whose own drop across the button is
                 // 1.7 dB.
                 chain.push(Fx {
+                    slot_index: index,
                     unit: Unit::Distortion(Distortion::new(drive, tone, level, mix, sample_rate)),
                     gain: 1.0,
                 });
@@ -223,6 +286,7 @@ pub fn build_chain(
             },
         };
         chain.push(Fx {
+            slot_index: index,
             unit,
             gain: slot.output_gain.clamp(0.0, 8.0),
         });
@@ -240,6 +304,14 @@ struct Delay {
     pan: f32,
     lp_left: f32,
     lp_right: f32,
+}
+
+fn delay_indices(write: usize, delay: f32, len: usize) -> (usize, usize, f32) {
+    // f32 rem_euclid can round a tiny negative position up to len itself. Use f64 for the
+    // wrapped read position and modulo the integer index as well, so neither tap can equal len.
+    let read = (write as f64 - delay as f64).rem_euclid(len as f64);
+    let a = read.floor() as usize % len;
+    (a, (a + 1) % len, (read - read.floor()) as f32)
 }
 
 impl Delay {
@@ -268,11 +340,7 @@ impl Delay {
     }
 
     fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
-        let len = self.left.len() as f32;
-        let read = (self.write as f32 - self.time).rem_euclid(len);
-        let a = read.floor() as usize;
-        let b = (a + 1) % self.left.len();
-        let frac = read - a as f32;
+        let (a, b, frac) = delay_indices(self.write, self.time, self.left.len());
         let dl = self.left[a] * (1.0 - frac) + self.left[b] * frac;
         let dr = self.right[a] * (1.0 - frac) + self.right[b] * frac;
 
@@ -335,13 +403,9 @@ impl Chorus {
     }
 
     fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
-        let len = self.left.len() as f32;
         let lfo = (self.phase).sin() * 0.5 + 0.5;
         let delay = self.base * (1.0 + self.depth * (lfo * 2.0 - 1.0) * 0.8);
-        let read = (self.write as f32 - delay).rem_euclid(len);
-        let a = read.floor() as usize;
-        let b = (a + 1) % self.left.len();
-        let frac = read - a as f32;
+        let (a, b, frac) = delay_indices(self.write, delay, self.left.len());
         let dl = self.left[a] * (1.0 - frac) + self.left[b] * frac;
         let dr = self.right[a] * (1.0 - frac) + self.right[b] * frac;
         self.lp_left += (dl - self.lp_left) * 0.5;
@@ -371,6 +435,80 @@ const _: usize = MAX_CHANNELS;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_delay_wrap_never_reads_past_the_buffer() {
+        let (a, b, fraction) = delay_indices(192, 192.00002, 100803);
+        assert!(a < 100803 && b < 100803 && (0.0..1.0).contains(&fraction));
+        let mut effect = Fx {
+            slot_index: 0,
+            gain: 0.0,
+            unit: Unit::Delay(
+                Delay::from_params(
+                    &[4.0f32, 0.0, 0.0, 0.0]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                    48000.0,
+                )
+                .unwrap(),
+            ),
+        };
+        let (left, right) = effect.process(0.25, -0.25);
+        assert_eq!((left, right), (0.25, -0.25));
+    }
+
+    #[test]
+    fn equalizer_control_changes_the_audio_in_its_addressed_band() {
+        let mut params = vec![24u32.to_le_bytes(), 24u32.to_le_bytes()].concat();
+        for value in [100.0f32, 1.5, 0.0, 1000.0, 1.5, 0.0, 10000.0, 1.5, 0.0] {
+            params.extend_from_slice(&value.to_le_bytes());
+        }
+        let slot = EffectSlot {
+            module: 0x18,
+            module_version: 0x92,
+            params,
+            module_private: vec![],
+            bypass: false,
+            output_gain: 1.0,
+            dry_level: 0.0,
+        };
+        let runtime = openkontakt::KspRuntime::compile(
+            &[Some(
+                r#"
+        on init
+          declare ui_knob $boost(0,1000000,1)
+        end on
+        on ui_control($boost)
+          set_engine_par($ENGINE_PAR_GAIN2,$boost,-1,0,-1)
+        end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        let mut chain = build_chain(&[Some(slot)], 48000.0, &Default::default());
+        let energy = |chain: &mut Vec<Fx>| -> f64 {
+            let mut sum = 0.0;
+            for i in 0..4800 {
+                let x = (std::f32::consts::TAU * 1000.0 * i as f32 / 48000.0).sin() * 0.01;
+                let (y, _) = chain[0].process(x, x);
+                if i > 1000 {
+                    sum += (y as f64).powi(2);
+                }
+            }
+            sum
+        };
+        let before = energy(&mut chain);
+        runtime.set_control_value(0, "boost", 1000000);
+        chain[0].sync_parameters(&runtime.engine);
+        let after = energy(&mut chain);
+        assert!(
+            after > before * 20.0,
+            "EQ must boost the signal rather than only caching a parameter"
+        );
+    }
 
     fn slot(module: u16, params: Vec<f32>) -> EffectSlot {
         EffectSlot {
@@ -441,9 +579,7 @@ mod tests {
         let mut chain = build_chain(&[Some(slot.clone())], 48_000.0, &Default::default());
         assert_eq!(chain.len(), 1);
 
-        let input: Vec<f32> = (0..4_800)
-            .map(|i| (i as f32 * 0.05).sin() * 0.5)
-            .collect();
+        let input: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         let shaped: Vec<f32> = input
             .iter()
             .map(|sample| chain[0].process(*sample, *sample).0)
@@ -454,7 +590,10 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum::<f32>()
             / input.len() as f32;
-        assert!(difference > 0.01, "distortion barely changed the signal: {difference}");
+        assert!(
+            difference > 0.01,
+            "distortion barely changed the signal: {difference}"
+        );
         assert!(shaped.iter().all(|value| value.is_finite()));
 
         let mut overrides = std::collections::HashMap::new();

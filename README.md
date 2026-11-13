@@ -45,6 +45,12 @@ electric guitars and a string collection:
   sounding notes
 - Saved persistent values are restored after `on init` and replayed through `on ui_control`, so a
   reloaded instrument comes back with the user's mix, not the script defaults
+- UI and table callbacks deliver cross-slot PGS notifications and queue sound-producing actions;
+  saved slots restore in a batch before notification. Group gain/pan/tuning update active voices,
+  event gain/pan/tuning select the event id, and scripted notes return independent ids and honour
+  their offset and duration. Randomisation and menu relabelling builtins are supported.
+- Three-band parametric EQ subtype `0x18/24` is decoded and rendered, with live band gain/frequency
+  controls. Its knob mappings and RBJ DSP are approximations pending reference sweeps.
 - `on note` / `on release` are dispatched with the event variables and the group-routing builtins
   (`allow_group`, `disallow_group`, `play_note`, `note_off`, `change_note`, `ignore_event`), so
   panels that split sustained and release-trigger groups select groups per event — one ambisonic
@@ -120,13 +126,17 @@ marked with `unimplemented!()` / a clear diagnostic:
   fails explicitly.
 - **Legacy NKS containers** (Kontakt 1–4 `BPatchHeaderV42`) — the decompressed-length offset is not
   specified yet; detected and marked `unimplemented!()`.
-- **`on controller` and `on pgs_changed`** — parsed and compiled but not dispatched yet, so
-  half-pedal/CC-driven behaviour and pgs cross-script messaging are inert. `%CC[]` reads as 0.
+- **Modulation DSP and coroutine waits** — named `0x3B`/`0x3C` records, supported controller curves
+  and `find_mod`/`find_target` are read, but native modulation/time laws, gate/sidechain and the full
+  CC-to-envelope DSP remain unverified. External-envelope rendering is off by default; the
+  `OPENKONTAKT_EXTERNAL_ENVELOPES=1` research switch uses an experimental mapping. `wait()` still
+  advances a virtual clock rather than suspending/resuming callbacks.
 - **Script state locks** — dispatch itself now runs on the worker thread, but the GUI still shares
   the runtime's per-slot mutex with it. The audio callback only touches lock-free result queues and
   the send/parameter atomics.
 - **Effects** — racks and slots are parsed and the insert chain is rendered: **filter**, **gainer**,
-  **delay**, **chorus**/**flanger**, plus the **convolution send** (send rack + `load_ir_sample`).
+  **three-band parametric EQ**, **delay**, **chorus**/**flanger**, plus the **convolution send**
+  (send rack + `load_ir_sample` / `_load_ir_sample`).
   Every other module is preserved but silent, and LFO/follower modulators and start criteria are
   still not applied. Sends are approximated by one global send level rather than the stored 8-way
   matrix.
@@ -201,6 +211,13 @@ Play with the on-screen keyboard or the computer keyboard (`A W S E D F T G Y H 
 at C4). The MIDI input receives normal note on/off/choke events from the host.
 
 ## Tests and conformance
+
+Differential-render experiments can override the amplitude envelope duration with
+`OPENKONTAKT_ENV_SCALE` (positive finite multiplier, default `1`) and the script volume mapping
+with `OPENKONTAKT_VOLUME_LAW=linear` (default retains the existing dB law). Combine these with the
+existing `OPENKONTAKT_VELOCITY_EXP` and `OPENKONTAKT_GAIN_MODE=no_program` switches to test one
+hypothesis at a time. These are diagnostic settings, not established format rules or universal
+instrument corrections.
 
 ```bash
 cargo test -p openkontakt
