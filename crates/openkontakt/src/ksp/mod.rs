@@ -10,7 +10,7 @@
 pub mod parser;
 
 use parser::{BinOp, Callback, Expr, Program, Stmt, UiDecl, UiKind, UnOp, VarKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -67,10 +67,23 @@ enum Variable {
 #[derive(Default)]
 struct Vars {
     vars: HashMap<String, Variable>,
+    polyphonic: HashSet<String>,
+    note_vars: HashMap<i64, HashMap<String, Value>>,
+    note_context: Option<i64>,
 }
 
 impl Vars {
     fn get(&self, name: &str) -> Value {
+        if self.polyphonic.contains(name) {
+            // There is no note instance in UI/controller/listener callbacks. Do not leak the
+            // last played note's value into such a callback (notably note_off($eventid)).
+            return self
+                .note_context
+                .and_then(|id| self.note_vars.get(&id))
+                .and_then(|values| values.get(name))
+                .cloned()
+                .unwrap_or(Value::Int(0));
+        }
         match self.vars.get(name) {
             Some(Variable::Scalar(value)) => value.clone(),
             Some(Variable::Array(values)) => values.first().cloned().unwrap_or(Value::Int(0)),
@@ -79,6 +92,9 @@ impl Vars {
     }
 
     fn get_index(&self, name: &str, index: i64) -> Value {
+        if self.polyphonic.contains(name) {
+            return self.get(name);
+        }
         match self.vars.get(name) {
             Some(Variable::Array(values)) => values
                 .get(index.max(0) as usize)
@@ -90,6 +106,15 @@ impl Vars {
     }
 
     fn set(&mut self, name: &str, value: Value) {
+        if self.polyphonic.contains(name) {
+            if let Some(id) = self.note_context {
+                self.note_vars
+                    .entry(id)
+                    .or_default()
+                    .insert(name.to_string(), value);
+            }
+            return;
+        }
         match self.vars.get_mut(name) {
             Some(Variable::Scalar(slot)) => *slot = value,
             Some(Variable::Array(values)) => {
@@ -106,6 +131,10 @@ impl Vars {
     }
 
     fn set_index(&mut self, name: &str, index: i64, value: Value) {
+        if self.polyphonic.contains(name) {
+            self.set(name, value);
+            return;
+        }
         let index = index.max(0) as usize;
         match self.vars.get_mut(name) {
             Some(Variable::Array(values)) => {
@@ -440,6 +469,8 @@ pub struct EngineState {
     /// Built-in `%CC[128]`. The host's MIDI input writes it, and so does a script's
     /// `set_controller`: panels use controller numbers as a bus between their slots.
     cc: Mutex<[i64; 128]>,
+    /// Defaults belong to individual routes until a controller has actually been received.
+    cc_seen: Mutex<[bool; 128]>,
     /// Which controllers a *script* has written. A panel that drives a parameter from its own
     /// timer is the only case where the player knows what a controller means, so the engine keys
     /// its voice filter on this rather than on the host's MIDI input.
@@ -477,6 +508,7 @@ impl Default for EngineState {
             skin_offsets: Mutex::new(HashMap::new()),
             key_colors: Mutex::new([None; 128]),
             cc: Mutex::new([0; 128]),
+            cc_seen: Mutex::new([false; 128]),
             script_controllers: Mutex::new([false; 128]),
             tempo_bpm: Mutex::new(DEFAULT_TEMPO_BPM),
             listener_period_ms: Mutex::new(HashMap::new()),
@@ -489,14 +521,12 @@ impl EngineState {
         if !self.external_envelopes_enabled {
             return envelope;
         }
-        use crate::modulation::Source;
         let Some(routes) = self.modulation.get(group) else {
             return envelope;
         };
         let Some(amp) = routes.amp_slot() else {
             return envelope;
         };
-        let cc = self.cc.lock().map(|cc| *cc).unwrap_or([0; 128]);
         let mut values = [
             crate::envelope::ms_to_normalized(envelope.attack_ms),
             crate::envelope::ms_to_normalized(envelope.decay_ms),
@@ -505,13 +535,9 @@ impl EngineState {
         ];
         let mut changed = [false; 4];
         for source in &routes.modulators {
-            let Source::Controller { number, .. } = &source.source else {
+            let Some(input) = self.controller_source_value(&source.source) else {
                 continue;
             };
-            if *number >= 128 {
-                continue;
-            }
-            let input = cc[*number as usize];
             for (index, target) in source.targets.iter().enumerate() {
                 if target.destination != Some(amp) {
                     continue;
@@ -540,7 +566,7 @@ impl EngineState {
                     })
                     .map(|v| v as f32 / 1_000_000.0)
                     .unwrap_or(target.amount);
-                values[field] += amount * target.value(input.clamp(0, 127) as f32 / 127.0);
+                values[field] += amount * target.value(input);
                 changed[field] = true;
             }
         }
@@ -631,10 +657,36 @@ impl EngineState {
             .unwrap_or(0)
     }
 
+    /// A route's saved default is independent of `%CC`, and -1 disables it until input arrives.
+    pub fn controller_source_value(&self, source: &crate::modulation::Source) -> Option<f32> {
+        let crate::modulation::Source::Controller {
+            number,
+            raw_assignment,
+        } = source
+        else {
+            return None;
+        };
+        let index = *number as usize;
+        if index >= 128 {
+            return None;
+        }
+        let values = self.cc.lock().ok()?;
+        let seen = self.cc_seen.lock().ok()?;
+        if seen[index] {
+            Some(values[index].clamp(0, 127) as f32 / 127.0)
+        } else {
+            let saved = i32::from_le_bytes(*raw_assignment);
+            (0..=127).contains(&saved).then_some(saved as f32 / 127.0)
+        }
+    }
+
     fn set_controller(&self, number: i64, value: i64) {
         if (0..128).contains(&number) {
             if let Ok(mut values) = self.cc.lock() {
                 values[number as usize] = value;
+                if let Ok(mut seen) = self.cc_seen.lock() {
+                    seen[number as usize] = true;
+                }
             }
         }
     }
@@ -1235,6 +1287,7 @@ impl<'a> Interp<'a> {
             Stmt::Declare {
                 kind,
                 name,
+                polyphonic,
                 init,
                 array_init,
                 len,
@@ -1244,6 +1297,9 @@ impl<'a> Interp<'a> {
                     .map(|expr| self.eval(expr).map(|v| v.as_int().max(0) as usize))
                     .transpose()?;
                 self.vars.declare(*kind, name, len);
+                if *polyphonic {
+                    self.vars.polyphonic.insert(name.clone());
+                }
                 if let Some(init) = init {
                     let value = self.eval(init)?;
                     self.vars.set(name, value);
@@ -2638,6 +2694,9 @@ impl KspRuntime {
                 .cloned()
                 .collect();
             if callbacks.is_empty() {
+                if kind == "release" {
+                    state.vars.note_vars.remove(&event.id);
+                }
                 continue;
             }
 
@@ -2661,6 +2720,10 @@ impl KspRuntime {
                 .set("EVENT_VELOCITY", Value::Int(event.velocity));
             interp.vars.set("EVENT_ID", Value::Int(event.id));
             interp.vars.set("EVENT_STATUS", Value::Int(event.status));
+            interp.vars.note_context = matches!(kind, "note" | "release").then_some(event.id);
+            if kind == "note" {
+                interp.vars.note_vars.remove(&event.id);
+            }
             if let Some((number, value)) = controller {
                 interp.vars.set("CC_NUM", Value::Int(number));
                 interp.vars.set("CC_VALUE", Value::Int(value));
@@ -2673,6 +2736,10 @@ impl KspRuntime {
                     state.diagnostics.push(format!("KSP on {kind}: {error}"));
                     break;
                 }
+            }
+            interp.vars.note_context = None;
+            if kind == "release" {
+                interp.vars.note_vars.remove(&event.id);
             }
             state.vars = interp.vars;
             state.ui = interp.ui;
@@ -2907,7 +2974,132 @@ impl KspRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn polyphonic_values_follow_event_ids_and_do_not_leak_into_controllers() {
+        let runtime = KspRuntime::compile(
+            &[Some(
+                r#"
+            on init
+                declare polyphonic $saved
+            end on
+            on note
+                $saved := $EVENT_NOTE * 100 + $EVENT_ID
+            end on
+            on release
+                note_off($saved)
+            end on
+            on controller
+                note_off($saved)
+            end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        runtime.dispatch(
+            "note",
+            EventContext {
+                note: 60,
+                id: 11,
+                ..EventContext::default()
+            },
+        );
+        runtime.dispatch(
+            "note",
+            EventContext {
+                note: 64,
+                id: 12,
+                ..EventContext::default()
+            },
+        );
+        let control = runtime.controller(64, 0);
+        assert!(matches!(
+            control.actions.as_slice(),
+            [ScriptAction::NoteOff { id: 0 }]
+        ));
+        for (id, expected) in [(11, 6011), (12, 6412)] {
+            let release = runtime.dispatch(
+                "release",
+                EventContext {
+                    id,
+                    ..EventContext::default()
+                },
+            );
+            assert!(
+                matches!(release.actions.as_slice(), [ScriptAction::NoteOff { id }] if *id == expected)
+            );
+        }
+        assert!(runtime.slots[0].lock().unwrap().vars.note_vars.is_empty());
+    }
+
+    #[test]
+    fn polyphonic_state_is_freed_even_without_a_release_callback() {
+        let runtime = KspRuntime::compile(
+            &[Some(
+                r#"
+            on init
+                declare polyphonic $saved
+            end on
+            on note
+                $saved := $EVENT_ID
+            end on
+        "#
+                .into(),
+            )],
+            "",
+        );
+        runtime.initialize();
+        runtime.dispatch(
+            "note",
+            EventContext {
+                id: 7,
+                ..EventContext::default()
+            },
+        );
+        assert_eq!(runtime.slots[0].lock().unwrap().vars.note_vars.len(), 1);
+        runtime.dispatch(
+            "release",
+            EventContext {
+                id: 7,
+                ..EventContext::default()
+            },
+        );
+        assert!(runtime.slots[0].lock().unwrap().vars.note_vars.is_empty());
+    }
+
     use super::*;
+
+    #[test]
+    fn controller_defaults_are_per_route_until_host_or_script_input() {
+        use crate::modulation::Source;
+        let runtime = KspRuntime::compile(&[], "");
+        let route = |saved: i32| Source::Controller {
+            number: 70,
+            raw_assignment: saved.to_le_bytes(),
+        };
+        assert_eq!(runtime.engine.controller(70), 0);
+        assert_eq!(
+            runtime.engine.controller_source_value(&route(127)),
+            Some(1.0)
+        );
+        assert_eq!(runtime.engine.controller_source_value(&route(0)), Some(0.0));
+        assert_eq!(runtime.engine.controller_source_value(&route(-1)), None);
+        runtime.controller(70, 32);
+        for saved in [-1, 0, 127] {
+            assert_eq!(
+                runtime.engine.controller_source_value(&route(saved)),
+                Some(32.0 / 127.0)
+            );
+        }
+        let runtime =
+            KspRuntime::compile(&[Some("on init\n set_controller(70,0)\nend on".into())], "");
+        runtime.initialize();
+        assert_eq!(
+            runtime.engine.controller_source_value(&route(127)),
+            Some(0.0)
+        );
+    }
 
     #[test]
     fn named_controller_routes_are_addressed_and_experimental_envelopes_are_opt_in() {

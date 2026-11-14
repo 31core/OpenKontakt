@@ -5,6 +5,7 @@
 mod editor;
 mod engine;
 mod fx;
+mod measured_envelope;
 pub mod offline;
 mod params;
 mod script_worker;
@@ -23,6 +24,10 @@ use std::sync::atomic::Ordering;
 
 const MIN_EDITOR_SIZE: LogicalSize<f32> = LogicalSize::new(940.0, 620.0);
 const RESIZE_HINT: ResizeHint = ResizeHint::resizable().with_min_logical_size(MIN_EDITOR_SIZE);
+
+fn midi_cc_value(value: f32) -> i64 {
+    (value.clamp(0.0, 1.0) * 127.0).round() as i64
+}
 
 pub struct OpenKontakt {
     params: Arc<OpenKontaktParams>,
@@ -91,7 +96,7 @@ impl Plugin for OpenKontakt {
             ..AudioIOLayout::const_default()
         },
     ];
-    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+    const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
     const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
     const SAMPLE_ACCURATE_AUTOMATION: bool = false;
     const HARD_REALTIME_ONLY: bool = false;
@@ -125,6 +130,8 @@ impl Plugin for OpenKontakt {
         self.engine.set_sample_rate(buffer_config.sample_rate);
         self.sample_rate = buffer_config.sample_rate;
         self.engine.reset();
+        self.engine
+            .set_offline(buffer_config.process_mode == ProcessMode::Offline);
         self.shared.all_notes_off();
         // Pitch depends on two numbers that are invisible in the UI once a session is restored:
         // the engine rate and the global transposition. Log them, because "it sounds two semitones
@@ -199,15 +206,19 @@ impl Plugin for OpenKontakt {
                         self.shared.note_on(key.number_or_middle_c());
                         self.engine.note_on(key.number_or_middle_c(), velocity);
                     }
-                    NoteEvent::NoteOff { key, .. } | NoteEvent::Choke { key, .. } => {
+                    NoteEvent::NoteOff { key, .. } => {
                         self.shared.note_off(key.number_or_middle_c());
                         self.engine.note_off(key.number_or_middle_c());
+                    }
+                    NoteEvent::Choke { key, .. } => {
+                        self.shared.note_off(key.number_or_middle_c());
+                        self.engine.choke_note(key.number_or_middle_c());
                     }
                     NoteEvent::MidiCC {
                         channel, cc, value, ..
                     } => {
                         self.engine
-                            .controller(channel as i64, cc as i64, value as i64);
+                            .controller(channel as i64, cc as i64, midi_cc_value(value));
                     }
                     _ => {}
                 }
@@ -305,3 +316,19 @@ impl Vst3Plugin for OpenKontakt {
 
 nice_export_clap!(OpenKontakt);
 nice_export_vst3!(OpenKontakt);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_cc_input_preserves_all_midi_steps() {
+        assert_eq!(OpenKontakt::MIDI_INPUT, MidiConfig::MidiCCs);
+        for value in 0..=127 {
+            assert_eq!(midi_cc_value(value as f32 / 127.0), value);
+        }
+        assert_eq!(midi_cc_value(0.5), 64);
+        assert_eq!(midi_cc_value(-0.1), 0);
+        assert_eq!(midi_cc_value(1.1), 127);
+    }
+}

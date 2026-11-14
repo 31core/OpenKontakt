@@ -44,6 +44,10 @@ fn attack_exponent(curve: f32) -> f32 {
 /// Per-voice amplitude envelope built from the group's AHDSR at note start.
 #[derive(Clone, Copy, Debug)]
 struct Envelope {
+    measured: bool,
+    decay_elapsed: f32,
+    decay_samples: f32,
+    release_start: f32,
     time_scale: f32,
     release_total: f32,
     stage: EnvelopeStage,
@@ -75,6 +79,10 @@ impl Envelope {
         let release_samples = (envelope.release_ms.max(1.0) * rate).max(1.0);
         let sustain = envelope.sustain.clamp(0.0, 1.0);
         Self {
+            measured: false,
+            decay_elapsed: 0.0,
+            decay_samples,
+            release_start: 0.0,
             time_scale: scale,
             release_total: release_samples,
             stage: EnvelopeStage::Attack,
@@ -97,12 +105,20 @@ impl Envelope {
         self.attack_exponent = attack_exponent(envelope.attack_curve);
         self.sustain = envelope.sustain.clamp(0.0, 1.0);
         self.decay_dec = (1.0 - self.sustain) / (envelope.decay_ms.max(0.0) * rate).max(1.0);
+        self.decay_samples = (envelope.decay_ms.max(0.0) * rate).max(1.0);
         let release = (envelope.release_ms.max(1.0) * rate).max(1.0);
         if (release - self.release_total).abs() > 0.5 {
             if self.stage == EnvelopeStage::Release {
                 let elapsed = self.release_total - self.release_left;
                 self.release_left = (release - elapsed).max(1.0);
                 self.release_step = self.level / self.release_left;
+                if self.measured {
+                    // Preserve the current level when CC changes an already running release.
+                    let progress = (elapsed / release).clamp(0.0, 1.0);
+                    self.release_start = self.level
+                        / (1.0 - measured_ramp(progress, crate::measured_envelope::RELEASE_SHAPE))
+                            .max(1e-9);
+                }
             } else {
                 self.release_left = release;
             }
@@ -120,7 +136,11 @@ impl Envelope {
                 // is positive.
                 self.attack_elapsed += 1.0;
                 let progress = (self.attack_elapsed / self.attack_samples).min(1.0);
-                self.level = progress.powf(self.attack_exponent);
+                self.level = if self.measured {
+                    measured_ramp(progress, crate::measured_envelope::ATTACK_SHAPE)
+                } else {
+                    progress.powf(self.attack_exponent)
+                };
                 if progress >= 1.0 {
                     self.level = 1.0;
                     self.stage = if self.hold_left > 0.0 {
@@ -137,7 +157,16 @@ impl Envelope {
                 }
             }
             EnvelopeStage::Decay => {
-                self.level -= self.decay_dec;
+                if self.measured {
+                    self.decay_elapsed += 1.0;
+                    let progress = (self.decay_elapsed / self.decay_samples).min(1.0);
+                    self.level = self.sustain
+                        + (1.0 - self.sustain)
+                            * (1.0
+                                - measured_ramp(progress, crate::measured_envelope::DECAY_SHAPE));
+                } else {
+                    self.level -= self.decay_dec;
+                }
                 if self.level <= self.sustain {
                     self.level = self.sustain;
                     self.stage = EnvelopeStage::Sustain;
@@ -145,7 +174,15 @@ impl Envelope {
             }
             EnvelopeStage::Sustain => self.level = self.sustain,
             EnvelopeStage::Release => {
-                self.level -= self.release_step;
+                if self.measured {
+                    let progress = ((self.release_total - self.release_left + 1.0)
+                        / self.release_total)
+                        .clamp(0.0, 1.0);
+                    self.level = self.release_start
+                        * (1.0 - measured_ramp(progress, crate::measured_envelope::RELEASE_SHAPE));
+                } else {
+                    self.level -= self.release_step;
+                }
                 if self.level <= 0.0 || self.release_left <= 0.0 {
                     self.level = 0.0;
                     self.stage = EnvelopeStage::Off;
@@ -160,14 +197,24 @@ impl Envelope {
     /// Begin the fade-out. The envelope always takes the stored release time from wherever the
     /// level currently is, so a note released during its attack still gets the full fade.
     fn release(&mut self) {
-        if self.stage != EnvelopeStage::Off {
+        if self.stage != EnvelopeStage::Off
+            && !(self.measured && self.stage == EnvelopeStage::Release)
+        {
             self.stage = EnvelopeStage::Release;
+            self.release_start = self.level;
             self.release_step = self.level / self.release_left.max(1.0);
         }
     }
 }
 
+fn measured_ramp(progress: f32, shape: f32) -> f32 {
+    (-shape * progress).exp_m1() / (-shape).exp_m1()
+}
+
 struct Voice {
+    /// Its parent key was released while CC64 was down. This belongs to an event, not a key:
+    /// repeating that key must not lose the older note or release the newly held one.
+    held_by_pedal: bool,
     release_parent: Option<i64>,
     release_at: Option<u64>,
     group_index: usize,
@@ -214,6 +261,7 @@ impl Default for Voice {
     fn default() -> Self {
         Self {
             release_parent: None,
+            held_by_pedal: false,
             release_at: None,
             group_index: 0,
             unmixed_gain: 0.0,
@@ -238,6 +286,10 @@ impl Default for Voice {
             gain_right: 0.0,
             base_gain: 0.0,
             env: Envelope {
+                measured: false,
+                decay_elapsed: 0.0,
+                decay_samples: 1.0,
+                release_start: 0.0,
                 time_scale: 1.0,
                 release_total: 1.0,
                 stage: EnvelopeStage::Off,
@@ -290,6 +342,8 @@ enum TriggerPhase {
 }
 
 pub struct Engine {
+    /// Instrument-wide CC64 state, applied in the same order as note/script results.
+    sustain_down: bool,
     sample_rate: f32,
     voices: Vec<Voice>,
     age_counter: u64,
@@ -335,6 +389,8 @@ pub struct Engine {
     send_levels: [f32; 8],
     /// KSP interpreter thread; the audio callback only posts commands and applies results.
     script: Option<ScriptWorker>,
+    /// Freewheeling hosts must finish script callbacks before advancing the sample clock.
+    offline: bool,
     /// Controller value the sounding voices' filters were last tuned to.
     voice_controller: Option<i64>,
     /// Samples rendered so far: the clock the listener timers run on.
@@ -351,6 +407,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             sample_rate: 48_000.0,
+            sustain_down: false,
             voices: (0..MAX_VOICES).map(|_| Voice::default()).collect(),
             age_counter: 0,
             event_ids: [0; 128],
@@ -381,6 +438,7 @@ impl Default for Engine {
             bus_right: [0.0; 16],
             send_levels: [0.0; 8],
             script: None,
+            offline: false,
             ir: None,
             voice_controller: None,
             samples_rendered: 0,
@@ -392,11 +450,29 @@ impl Default for Engine {
 }
 
 impl Engine {
+    pub fn set_offline(&mut self, offline: bool) {
+        if self.offline == offline {
+            return;
+        }
+        self.offline = offline;
+        self.script = if offline {
+            None
+        } else {
+            self.current
+                .as_ref()
+                .map(|loaded| ScriptWorker::spawn(Arc::clone(&loaded.ksp)))
+        };
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
     }
 
     pub fn reset(&mut self) {
+        self.sustain_down = false;
+        self.event_ids.fill(0);
+        self.changed_notes.fill(None);
+        self.event_velocity.fill(0);
         for voice in &mut self.voices {
             voice.active = false;
             voice.env.stage = EnvelopeStage::Off;
@@ -415,6 +491,10 @@ impl Engine {
             _ => true,
         };
         if changed {
+            self.sustain_down = false;
+            self.event_ids.fill(0);
+            self.changed_notes.fill(None);
+            self.event_velocity.fill(0);
             self.current = instrument.clone();
             // A new instrument brings new listener timers; the old schedule must not carry over.
             self.listener_next.clear();
@@ -425,6 +505,7 @@ impl Engine {
             self.rebuild_insert_chain(instrument.as_deref());
             self.script = instrument
                 .as_ref()
+                .filter(|_| !self.offline)
                 .map(|loaded| ScriptWorker::spawn(Arc::clone(&loaded.ksp)));
         } else {
             self.current = instrument;
@@ -767,6 +848,10 @@ impl Engine {
     }
 
     pub fn note_on(&mut self, key: u8, velocity: f32) {
+        if self.offline {
+            self.note_on_blocking(key, velocity);
+            return;
+        }
         let Some(loaded) = self.current.clone() else {
             return;
         };
@@ -809,17 +894,25 @@ impl Engine {
             }
         }
         for result in results {
+            self.apply_sustain(result.sustain_down);
             match result.command {
                 ScriptCommand::NoteOn { key, velocity, id } => {
                     let allowed = result.dispatch.allowed_groups.clone();
                     let note = Self::changed_note(&result.dispatch.actions, id);
                     self.changed_notes[key as usize & 127] = note;
                     if !result.dispatch.ignore_event {
-                        self.trigger_at(note.unwrap_or(key), key, velocity, allowed.as_deref());
+                        self.trigger_note_event(
+                            note.unwrap_or(key),
+                            key,
+                            velocity,
+                            allowed.as_deref(),
+                            id,
+                        );
                     }
                     self.execute_actions(&result.dispatch.actions, allowed.as_deref());
                 }
-                ScriptCommand::NoteOff { key, velocity, .. } => {
+                ScriptCommand::NoteOff { key, velocity, id } => {
+                    self.release_key_event(id);
                     let allowed = result.dispatch.allowed_groups.clone();
                     // The release-trigger groups are chosen by `on release`, exactly like the
                     // note-on groups are chosen by `on note`: a script that disallows every group
@@ -901,9 +994,8 @@ impl Engine {
     /// the caller's thread and every event lands on an exact sample. A render must not depend on
     /// how quickly a worker thread wakes up.
     pub(crate) fn set_instrument_blocking(&mut self, loaded: Arc<LoadedInstrument>) {
-        self.set_instrument(None);
-        self.current = Some(Arc::clone(&loaded));
-        self.rebuild_insert_chain(Some(&loaded));
+        self.set_offline(true);
+        self.set_instrument(Some(loaded));
     }
 
     /// Note on with the script applied synchronously. Same effect as `note_on` + `poll_script`,
@@ -927,6 +1019,7 @@ impl Engine {
                 status: 1,
             },
         );
+        self.apply_sustain(loaded.ksp.engine.controller(64) >= 64);
         let allowed = dispatch.allowed_groups.clone();
         let note = Self::changed_note(&dispatch.actions, id);
         self.changed_notes[key as usize & 127] = note;
@@ -934,7 +1027,13 @@ impl Engine {
             eprintln!("debug: mask for key {key} vel {velocity_127} = {allowed:?}");
         }
         if !dispatch.ignore_event {
-            self.trigger_at(note.unwrap_or(key), key, velocity_127, allowed.as_deref());
+            self.trigger_note_event(
+                note.unwrap_or(key),
+                key,
+                velocity_127,
+                allowed.as_deref(),
+                id,
+            );
         }
         self.execute_actions(&dispatch.actions, allowed.as_deref());
     }
@@ -956,14 +1055,8 @@ impl Engine {
             },
         );
         self.changed_notes[key as usize & 127] = None;
-        for voice in &mut self.voices {
-            if voice.active
-                && voice.release_parent == Some(id)
-                && voice.env.stage != EnvelopeStage::Release
-            {
-                voice.env.release();
-            }
-        }
+        self.apply_sustain(loaded.ksp.engine.controller(64) >= 64);
+        self.release_key_event(id);
         let velocity = self.event_velocity[key as usize & 127];
         // Same allowlist as note-on: `on release` disallows every group and allows the release
         // sets, so ignoring it fires the release samples of every articulation at once.
@@ -979,25 +1072,58 @@ impl Engine {
     /// Controller event with the script applied synchronously.
     pub(crate) fn controller_blocking(&mut self, number: i64, value: i64) {
         let Some(loaded) = self.current.clone() else {
+            if number == 64 {
+                self.apply_sustain(value >= 64);
+            }
             return;
         };
-        let dispatch = loaded.ksp.dispatch(
-            "controller",
-            EventContext {
-                note: number,
-                velocity: value,
-                id: 0,
-                status: 1,
-            },
-        );
+        let dispatch = loaded.ksp.controller(number, value);
+        self.apply_sustain(loaded.ksp.engine.controller(64) >= 64);
         self.execute_actions(&dispatch.actions, dispatch.allowed_groups.as_deref());
     }
 
     /// Hand a MIDI controller to the scripts. The interpreter runs on the worker thread; any
     /// `play_note` it decides on is applied when the result is polled.
     pub fn controller(&mut self, _channel: i64, number: i64, value: i64) {
+        if self.offline {
+            self.controller_blocking(number, value);
+            return;
+        }
         if let Some(worker) = self.script.as_mut() {
             worker.submit(ScriptCommand::Controller { number, value });
+        } else if number == 64 {
+            self.apply_sustain(value >= 64);
+        }
+    }
+
+    fn apply_sustain(&mut self, down: bool) {
+        self.sustain_down = down;
+        if !down {
+            for voice in &mut self.voices {
+                if voice.held_by_pedal {
+                    voice.held_by_pedal = false;
+                    if voice.active {
+                        voice.env.release();
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_key_event(&mut self, id: i64) {
+        if id == 0 {
+            return;
+        }
+        for voice in &mut self.voices {
+            if voice.active
+                && voice.release_parent == Some(id)
+                && !matches!(voice.env.stage, EnvelopeStage::Release | EnvelopeStage::Off)
+            {
+                voice.held_by_pedal = self.sustain_down;
+                if !self.sustain_down {
+                    voice.env.release();
+                }
+            }
         }
     }
 
@@ -1072,6 +1198,7 @@ impl Engine {
                 ScriptAction::NoteOff { id } => {
                     for voice in &mut self.voices {
                         if voice.active && voice.event_id == *id {
+                            voice.held_by_pedal = false;
                             voice.env.release();
                         }
                     }
@@ -1094,10 +1221,15 @@ impl Engine {
     }
 
     fn sync_voice_envelopes(&mut self) {
-        if !self
+        let experimental = self
             .current
             .as_ref()
-            .is_some_and(|loaded| loaded.ksp.engine.external_envelopes_enabled)
+            .is_some_and(|loaded| loaded.ksp.engine.external_envelopes_enabled);
+        if !experimental
+            && !self
+                .voices
+                .iter()
+                .any(|voice| voice.active && voice.env.measured)
         {
             return;
         }
@@ -1108,8 +1240,12 @@ impl Engine {
                 .or_insert_with(|| self.voice_envelope(voice.group_index));
         }
         for voice in self.voices.iter_mut().filter(|v| v.active) {
-            if let Some(envelope) = envelopes.get(&voice.group_index) {
-                voice.env.update(*envelope, self.sample_rate);
+            if let Some((envelope, measured)) = envelopes.get(&voice.group_index) {
+                // Unmatched envelopes retain the legacy update policy.
+                if *measured || voice.env.measured || experimental {
+                    voice.env.measured = *measured;
+                    voice.env.update(*envelope, self.sample_rate);
+                }
             }
         }
     }
@@ -1182,6 +1318,24 @@ impl Engine {
         self.trigger_phase_at(note, event_key, velocity_127, allowed, TriggerPhase::NoteOn);
     }
 
+    fn trigger_note_event(
+        &mut self,
+        note: u8,
+        key: u8,
+        velocity: u8,
+        allowed: Option<&[bool]>,
+        id: i64,
+    ) {
+        let age = self.age_counter;
+        self.trigger_at(note, key, velocity, allowed);
+        for voice in self.voices.iter_mut().filter(|v| v.active && v.age > age) {
+            // A newer strike of the same key may already have been queued while this callback
+            // was running. Its key-indexed ID must not overwrite this event's identity.
+            voice.event_id = id;
+            voice.release_parent = Some(id);
+        }
+    }
+
     /// Start voices for a key, restricted to the groups that belong to this phase.
     ///
     /// A release-trigger group is the recorded sound of the key being let go: playing it on note-on
@@ -1240,11 +1394,15 @@ impl Engine {
             .and_then(|value| value.parse().ok())
             .unwrap_or(8);
         for zone in &instrument.zones {
-            let fallback_fade = if loaded
-                .explicit_velocity_fades
-                .get(zone.group_index)
-                .copied()
-                .unwrap_or(false)
+            // Release layers are selected by their authored ranges. Expanding them can add a
+            // second, longer recording after note-off even when the file defines no overlap.
+            // Explicit zone fades still apply inside velocity_weight with a zero fallback.
+            let fallback_fade = if phase == TriggerPhase::NoteOff
+                || loaded
+                    .explicit_velocity_fades
+                    .get(zone.group_index)
+                    .copied()
+                    .unwrap_or(false)
             {
                 0
             } else {
@@ -1375,6 +1533,7 @@ impl Engine {
 
             started += 1;
             self.start_voice(Voice {
+                held_by_pedal: false,
                 release_parent: Some(event_id),
                 release_at: None,
                 group_index: zone.group_index,
@@ -1403,7 +1562,11 @@ impl Engine {
                 gain_left,
                 gain_right,
                 base_gain,
-                env: Envelope::new(envelope, self.sample_rate),
+                env: {
+                    let mut env = Envelope::new(envelope.0, self.sample_rate);
+                    env.measured = envelope.1;
+                    env
+                },
                 filter,
                 age: 0,
                 fade_gain: 1.0,
@@ -1433,15 +1596,20 @@ impl Engine {
     /// KSP exposes the group amplitude envelope as `$ENGINE_PAR_ATTACK`/`DECAY`/`SUSTAIN`/`RELEASE`
     /// at 0..1. Times map exponentially so 0 is instant and 1 is long; those limits are a player
     /// choice, not file data.
-    fn voice_envelope(&self, group_index: usize) -> Ahdsr {
+    fn voice_envelope(&self, group_index: usize) -> (Ahdsr, bool) {
         let mut envelope = self
             .group_envelopes
             .get(group_index)
             .copied()
             .unwrap_or_default();
         let Some(loaded) = self.current.as_ref() else {
-            return envelope;
+            return (envelope, false);
         };
+        if let Some(measured) =
+            crate::measured_envelope::response(&loaded.ksp.engine, group_index, envelope)
+        {
+            return (measured, true);
+        }
         let parameter = |name: &str| {
             loaded
                 .ksp
@@ -1463,10 +1631,13 @@ impl Engine {
         if let Some(value) = parameter("ENGINE_PAR_SUSTAIN") {
             envelope.sustain = value.clamp(0.0, 1.0);
         }
-        loaded
-            .ksp
-            .engine
-            .modulate_amp_envelope(group_index, envelope)
+        (
+            loaded
+                .ksp
+                .engine
+                .modulate_amp_envelope(group_index, envelope),
+            false,
+        )
     }
 
     /// Put a voice in the pool, making room if the polyphony limit is reached.
@@ -1545,29 +1716,39 @@ impl Engine {
     }
 
     pub fn note_off(&mut self, key: u8) {
+        if self.offline {
+            self.note_off_blocking(key);
+            return;
+        }
         let id = self.event_ids[key as usize & 127];
         let velocity = self.event_velocity[key as usize & 127];
-        // The sounding voices release immediately; the release-trigger samples wait for the
-        // script, whose `on release` decides which groups may play them.
-        for voice in &mut self.voices {
-            if voice.active
-                && voice.release_parent == Some(id)
-                && voice.env.stage != EnvelopeStage::Release
-            {
-                voice.env.release();
-            }
-        }
         if let Some(worker) = self.script.as_mut() {
+            // Apply the envelope decision with the callback result, in FIFO order with CC64.
+            // Otherwise a pedal-down still queued on the worker can lose the note immediately.
             worker.submit(ScriptCommand::NoteOff { key, velocity, id });
         } else {
+            self.release_key_event(id);
             self.trigger_phase(key, velocity, None, TriggerPhase::NoteOff);
         }
     }
 
     pub fn choke_all(&mut self) {
+        self.sustain_down = false;
         for voice in &mut self.voices {
+            voice.held_by_pedal = false;
             voice.active = false;
             voice.env.stage = EnvelopeStage::Off;
+        }
+    }
+
+    /// A host choke is an immediate stop, not a physical key release held by the damper.
+    pub fn choke_note(&mut self, key: u8) {
+        for voice in &mut self.voices {
+            if voice.active && voice.note == key {
+                voice.held_by_pedal = false;
+                voice.active = false;
+                voice.env.stage = EnvelopeStage::Off;
+            }
         }
     }
 
@@ -1717,6 +1898,300 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    fn held_voice(id: i64) -> Voice {
+        let mut voice = Voice {
+            active: true,
+            event_id: id,
+            release_parent: Some(id),
+            env: Envelope::new(Ahdsr::default(), 48_000.0),
+            ..Voice::default()
+        };
+        voice.env.stage = EnvelopeStage::Sustain;
+        voice.env.level = 1.0;
+        voice
+    }
+
+    #[test]
+    fn cc64_holds_released_events_but_not_the_next_strike_of_the_same_key() {
+        let mut engine = Engine::default();
+        engine.voices[0] = held_voice(1);
+        engine.voices[1] = held_voice(2); // same key, newer strike still physically held
+        engine.controller(0, 64, 64);
+        engine.release_key_event(1);
+        assert!(engine.voices[0].held_by_pedal);
+        assert_eq!(engine.voices[0].env.stage, EnvelopeStage::Sustain);
+        engine.controller(0, 64, 63);
+        assert_eq!(engine.voices[0].env.stage, EnvelopeStage::Release);
+        assert_eq!(engine.voices[1].env.stage, EnvelopeStage::Sustain);
+        assert!(!engine.voices[0].held_by_pedal);
+        engine.controller(0, 64, 127);
+        assert_eq!(
+            engine.voices[0].env.stage,
+            EnvelopeStage::Release,
+            "re-pedalling must not resurrect a released envelope"
+        );
+        engine.release_key_event(2);
+        engine.controller(0, 64, 0);
+        assert_eq!(engine.voices[1].env.stage, EnvelopeStage::Release);
+    }
+
+    #[test]
+    fn pedal_up_does_not_restart_release_and_script_note_off_can_stop_a_held_voice() {
+        let mut engine = Engine::default();
+        engine.voices[0] = held_voice(1);
+        engine.apply_sustain(true);
+        engine.release_key_event(1);
+        engine.execute_actions(&[ScriptAction::NoteOff { id: 1 }], None);
+        assert!(!engine.voices[0].held_by_pedal);
+        let level = engine.voices[0].env.next();
+        engine.apply_sustain(false);
+        assert!(engine.voices[0].env.next() < level);
+        engine.apply_sustain(true);
+        engine.reset();
+        assert!(!engine.sustain_down);
+        assert_eq!(engine.voice_count(), 0);
+    }
+
+    #[test]
+    fn host_choke_stops_a_pedal_held_note_without_releasing_other_keys() {
+        let mut engine = Engine::default();
+        engine.voices[0] = held_voice(1);
+        engine.voices[0].note = 60;
+        engine.voices[1] = held_voice(2);
+        engine.voices[1].note = 64;
+        engine.apply_sustain(true);
+        engine.release_key_event(1);
+        engine.choke_note(60);
+        assert!(!engine.voices[0].active);
+        assert!(!engine.voices[0].held_by_pedal);
+        assert!(engine.voices[1].active);
+        assert!(engine.sustain_down);
+    }
+
+    #[test]
+    fn queued_cc64_and_note_off_keep_command_order_even_if_runtime_runs_ahead() {
+        let runtime = Arc::new(openkontakt::KspRuntime::compile(&[], ""));
+        runtime.initialize();
+        let mut engine = Engine::default();
+        engine.voices[0] = held_voice(1);
+        engine.event_ids[60] = 1;
+        engine.script = Some(ScriptWorker::spawn(Arc::clone(&runtime)));
+        engine.controller(0, 64, 127);
+        engine.note_off(60);
+        engine.controller(0, 64, 0);
+        engine.controller(0, 64, 127);
+        engine.controller(0, 1, 7); // sentinel: let the interpreter run ahead of audio results
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.engine.controller(1) != 7 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(runtime.engine.controller(1), 7);
+        while std::time::Instant::now() < deadline {
+            engine.poll_script();
+            if engine.sustain_down && engine.voices[0].env.stage == EnvelopeStage::Release {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(engine.sustain_down);
+        assert_eq!(
+            engine.voices[0].env.stage,
+            EnvelopeStage::Release,
+            "the intermediate pedal-up must release the old note despite the final pedal-down"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the retail Lite preset; set OPENKONTAKT_OFFLINE_NKI"]
+    fn cc64_preserves_main_lite_notes_without_repeating_release_samples() {
+        let path = std::env::var("OPENKONTAKT_OFFLINE_NKI").expect("instrument path");
+        let loaded = Arc::new(crate::state::load_instrument(std::path::Path::new(&path)).unwrap());
+        let mut engine = Engine::default();
+        engine.set_instrument_blocking(Arc::clone(&loaded));
+        engine.controller_blocking(64, 127);
+        engine.note_on_blocking(69, 80.0 / 127.0);
+        let old_id = engine.event_ids[69];
+        engine.note_off_blocking(69);
+        let held = engine
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.active && v.held_by_pedal)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert!(
+            held.len() >= 2,
+            "both microphones must remain held by the pedal"
+        );
+        engine.note_on_blocking(69, 80.0 / 127.0);
+        let new_id = engine.event_ids[69];
+        assert_ne!(old_id, new_id);
+        let before = engine.age_counter;
+        engine.controller_blocking(64, 0);
+        assert!(
+            engine
+                .voices
+                .iter()
+                .filter(|v| v.active && v.age > before)
+                .all(|v| !loaded.instrument.groups[v.group_index].release_trigger),
+            "pedal-up may play scripted pedal noise, but must not replay key-release groups"
+        );
+        assert!(
+            held.iter()
+                .all(|&i| engine.voices[i].env.stage == EnvelopeStage::Release)
+        );
+        assert!(
+            engine
+                .voices
+                .iter()
+                .filter(|v| v.active && v.event_id == new_id)
+                .all(|v| v.env.stage != EnvelopeStage::Release)
+        );
+        let new_voices = engine
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.active && v.event_id == new_id)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        engine.note_off_blocking(69);
+        assert!(
+            new_voices
+                .iter()
+                .all(|&i| engine.voices[i].env.stage == EnvelopeStage::Release)
+        );
+    }
+
+    #[test]
+    fn measured_release_preserves_level_when_duration_changes() {
+        let mut settings = Ahdsr {
+            attack_ms: 0.0,
+            release_ms: 226.384,
+            ..Ahdsr::default()
+        };
+        let mut env = Envelope::new(settings, 48_000.0);
+        env.measured = true;
+        env.next();
+        env.release();
+        for _ in 0..2400 {
+            env.next();
+        }
+        let before = env.level;
+        settings.release_ms = 102.226;
+        env.update(settings, 48_000.0);
+        let after = env.next();
+        assert!(
+            after <= before && before - after < 0.001,
+            "CC edit must not jump: {before} -> {after}"
+        );
+        for _ in 0..6000 {
+            env.next();
+        }
+        assert_eq!(env.stage, EnvelopeStage::Off);
+        assert_eq!(env.level, 0.0);
+    }
+
+    #[test]
+    #[ignore = "requires the retail Lite preset; set OPENKONTAKT_OFFLINE_NKI"]
+    fn measured_response_only_accepts_captured_preset_configuration() {
+        let path = std::env::var("OPENKONTAKT_OFFLINE_NKI").expect("instrument path");
+        let loaded = Arc::new(crate::state::load_instrument(std::path::Path::new(&path)).unwrap());
+        let mut engine = Engine::default();
+        engine.set_instrument_blocking(Arc::clone(&loaded));
+        engine.note_on_blocking(69, 80.0 / 127.0);
+        for group in [4, 5, 6, 84, 85, 86] {
+            let (env, measured) = engine.voice_envelope(group);
+            assert!(measured, "expected captured sustained group {group}");
+            assert!((env.attack_ms - 8.918015).abs() < 0.01);
+        }
+        assert!(
+            !engine.voice_envelope(7).1,
+            "release sample envelope was not calibrated"
+        );
+        engine.controller_blocking(84, 127);
+        assert!((engine.voice_envelope(4).0.attack_ms - 358.21918).abs() < 0.01);
+        engine.controller_blocking(70, 64);
+        assert!(
+            !engine.voice_envelope(4).1,
+            "uncaptured decay configuration must fall back"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the retail Lite preset; set OPENKONTAKT_OFFLINE_NKI"]
+    fn release_boundary_does_not_expand_into_the_next_velocity_layer() {
+        let path = std::env::var("OPENKONTAKT_OFFLINE_NKI").expect("instrument path");
+        let loaded = Arc::new(crate::state::load_instrument(std::path::Path::new(&path)).unwrap());
+        let expected = loaded
+            .instrument
+            .zones
+            .iter()
+            .filter(|z| [7, 87].contains(&z.group_index) && z.matches(69, 80))
+            .map(|z| {
+                loaded.samples[&z.sample.as_ref().unwrap().filename_id]
+                    .path
+                    .clone()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(expected.len(), 2);
+        let mut engine = Engine::default();
+        engine.set_instrument_blocking(loaded);
+        engine.note_on(69, 80.0 / 127.0);
+        let age = engine.age_counter;
+        engine.note_off(69);
+        let release = engine
+            .voices
+            .iter()
+            .filter(|v| v.active && v.age > age)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            release.len(),
+            2,
+            "only one release sample per microphone should start"
+        );
+        assert_eq!(
+            release
+                .iter()
+                .map(|v| v.sample.sample().path.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the retail Lite preset; set OPENKONTAKT_OFFLINE_NKI"]
+    fn host_offline_events_finish_before_the_sample_clock_advances() {
+        let path = std::env::var("OPENKONTAKT_OFFLINE_NKI").expect("instrument path");
+        let loaded = Arc::new(crate::state::load_instrument(std::path::Path::new(&path)).unwrap());
+        let mut engine = Engine::default();
+        // Use the same entry points as a host, rather than the offline helper methods.
+        engine.set_offline(true);
+        engine.set_instrument(Some(Arc::clone(&loaded)));
+        engine.prepare_block();
+        engine.controller(0, 7, 100);
+        assert_eq!(loaded.ksp.engine.controller(7), 100);
+        engine.note_on(67, 49.0 / 127.0);
+        engine.note_on(79, 49.0 / 127.0);
+        assert_eq!(engine.samples_rendered, 0);
+        assert_eq!(engine.voice_count(), 4, "both notes must already be routed");
+        assert!(engine.script.is_none());
+        let peak = (0..512)
+            .map(|_| {
+                let (l, r) = engine.render_sample();
+                l.abs().max(r.abs())
+            })
+            .fold(0.0f32, f32::max);
+        assert!(peak > 0.001, "the attack must not wait for a worker thread");
+        let before = engine.voice_count();
+        engine.note_off(67);
+        engine.note_off(79);
+        assert!(
+            engine.voice_count() > before,
+            "release samples must start synchronously"
+        );
+        assert_eq!(engine.samples_rendered, 512);
+    }
+
     use super::*;
 
     #[test]

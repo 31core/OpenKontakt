@@ -85,6 +85,16 @@ electric guitars and a string collection:
   chosen by its target, not by its position, or a plucked instrument inherits the filter's 3.6 s
   attack. `get_engine_par`/`get_engine_par_disp` answer from the same envelope, so a panel's knobs
   read `0.00 ms / 500.0 ms / 0.0 dB / 501.6 ms` instead of zeros
+- **CC64 sustain pedal**: values 64–127 hold released parent-note voices; 0–63 release only those
+  pedal-held voices, leaving physically held keys sounding. Key-release scripts still run once
+  at note-off; pedal-up does not replay release triggers. Deferred voices track event IDs so
+  repeated strikes of the same key stay independent. Live script results carry ordered pedal
+  snapshots, matching synchronous offline playback. This implements a binary, instrument-wide
+  damper pedal; continuous half-pedal damping and repedalling are not modelled.
+- **Polyphonic KSP integers**: `declare polyphonic` retains separate values per note-event ID
+  through `on release`, then frees them. Non-note callbacks see no note instance (read as zero,
+  writes discarded), preventing a controller callback from stopping the most recent note by
+  accidentally reading its saved ID. Ordinary scalar variables keep their slot-wide state.
 - **Per-bus sends**: voices accumulate into their 16 instrument buses, each bus is gained
   individually, and every bus contributes to the send in proportion to its own
   `$ENGINE_PAR_SENDLEVEL_n`, feeding the convolution return
@@ -92,9 +102,11 @@ electric guitars and a string collection:
   preload (`Program.dfd_preload`) is touched up front, so a ~500 MB string library costs 47 MB
   resident and loads in 0.3 s instead of several seconds — a 10 GB library maps the same way.
   Packed `.ncw` samples decode on read with the same preload rule
-- **Off-thread scripting**: the KSP interpreter runs on its own worker thread. The audio callback
-  only posts note/CC commands and applies results (polled every sample, so a note starts within a
-  few samples), and impulse responses are loaded on a separate thread as well
+- **Script scheduling**: realtime playback posts note/CC commands to a KSP worker and polls its
+  results every sample; callback completion time still determines note latency. When the host
+  reports offline rendering, note, release, controller, and listener callbacks run synchronously
+  so fast export does not advance past pending script decisions. Impulse responses use a separate
+  loader; offline effect loading and full convolution parameter parity remain incomplete.
 - Full `.wav` loading (PCM 8/16/24/32-bit and 32-bit float, mono/stereo), with the WAV header taking
   precedence over the zone's stored sample metadata
 - **`.ncw` loading**: header, block table, 512-frame blocks, LSB-first packing, delta-coded blocks
@@ -128,9 +140,23 @@ marked with `unimplemented!()` / a clear diagnostic:
   specified yet; detected and marked `unimplemented!()`.
 - **Modulation DSP and coroutine waits** — named `0x3B`/`0x3C` records, supported controller curves
   and `find_mod`/`find_target` are read, but native modulation/time laws, gate/sidechain and the full
-  CC-to-envelope DSP remain unverified. External-envelope rendering is off by default; the
+  CC-to-envelope DSP remain unverified. Velocity-to-volume routes are indexed but not rendered;
+  playback still uses a legacy global velocity exponent rather than the authored route.
+  Host CC input preserves all 128 values; controller routes use their own saved default until
+  host or script input arrives, including the disabled-until-input default of -1.
+  A narrowly matched, measured compatibility response now renders Main Lite's sustained
+  amplitude-envelope CC84/CC72 routes at CC70=CC71=127, including nonlinear attack, decay and
+  release. It matches the stored envelope and complete relevant route curves, not a filename;
+  direct envelope edits, different route depths and uncaptured decay/sustain settings fall back.
+  Five captured controller values define effective durations, with interpolation between them;
+  this is not a recovered universal Kontakt parameter law. Release-sample envelopes and authored
+  velocity modulation are not calibrated by this response.
+  General external-envelope rendering is off by default; the
   `OPENKONTAKT_EXTERNAL_ENVELOPES=1` research switch uses an experimental mapping. `wait()` still
   advances a virtual clock rather than suspending/resuming callbacks.
+- **Release velocity layers** use authored ranges and explicit fades. The legacy inferred
+  velocity-range expansion is restricted to note-on playback so a neighbouring, longer release
+  recording is not added at a velocity boundary.
 - **Script state locks** — dispatch itself now runs on the worker thread, but the GUI still shares
   the runtime's per-slot mutex with it. The audio callback only touches lock-free result queues and
   the send/parameter atomics.

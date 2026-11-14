@@ -43,6 +43,9 @@ pub enum ScriptCommand {
 pub struct ScriptResult {
     pub command: ScriptCommand,
     pub dispatch: Dispatch,
+    /// Snapshot in command order, including changes made by the callback itself. Reading the
+    /// shared runtime later can see a newer pedal event before earlier notes have been applied.
+    pub sustain_down: bool,
 }
 
 pub struct ScriptWorker {
@@ -67,7 +70,11 @@ impl ScriptWorker {
                         continue;
                     };
                     let dispatch = dispatch(&runtime, command);
-                    let mut pending = ScriptResult { command, dispatch };
+                    let mut pending = ScriptResult {
+                        command,
+                        dispatch,
+                        sustain_down: runtime.engine.controller(64) >= 64,
+                    };
                     // Push until there is room; if the audio side is not draining, drop it.
                     let mut spins = 0;
                     while let Err(rtrb::PushError::Full(returned)) = results_tx.push(pending) {

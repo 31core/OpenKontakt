@@ -35,6 +35,8 @@ fn main() {
                             .map(|t| (
                                 &t.parameter,
                                 t.destination,
+                                t.amount,
+                                t.inverted,
                                 t.curve.as_ref().map(|c| &c.points)
                             ))
                             .collect::<Vec<_>>()

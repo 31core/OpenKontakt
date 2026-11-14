@@ -48,8 +48,12 @@ loading remains unestablished; it must not be inferred from a particular interpr
 | `!` | string array |
 
 `declare` creates a variable at its default (0 or empty), optionally with an initialiser list.
-`const` declares a compile-time constant. A `polyphonic $x` is one value per voice, which is how a
-script tracks per-note state. Variables are scoped to the slot, not shared between slots — a script
+`const` declares a compile-time constant. A `polyphonic $x` is one integer value per note event,
+initially zero, retained for that event's `on release` callback. Overlapping notes, including
+repeated strikes of the same key, have separate values. Polyphonic variables are only valid in
+note and release callbacks; a controller callback has no corresponding note instance.
+See the [KSP variable reference](https://docs.native-instruments.com/ni-tech-manuals/ksp-manual/en/variables).
+Variables are scoped to the slot, not shared between slots — a script
 that wants to talk to another one uses `pgs_*` instead.
 
 `$ENGINE_PAR_*`, `$CONTROL_PAR_*`, `$EVENT_PAR_*` and `$KEY_COLOR_*` are integer constants, not

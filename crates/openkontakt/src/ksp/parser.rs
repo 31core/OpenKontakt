@@ -83,6 +83,7 @@ pub enum Stmt {
     Declare {
         kind: VarKind,
         name: String,
+        polyphonic: bool,
         init: Option<Expr>,
         /// `declare %interval[20] := (0, 0, 12, 19, …)` — a whole array in one statement.
         array_init: Option<Vec<Expr>>,
@@ -449,8 +450,10 @@ impl Parser {
 
     fn declare(&mut self) -> Result<Stmt, String> {
         // `declare const $x := 1` and `declare polyphonic $x` are attributes on the declaration.
+        let mut polyphonic = false;
         while matches!(self.peek(), Tok::Ident(w) if w == "const" || w == "polyphonic" || w == "persistent")
         {
+            polyphonic |= matches!(self.peek(), Tok::Ident(w) if w == "polyphonic");
             self.pos += 1;
         }
         if let Tok::Ident(keyword) = self.peek().clone() {
@@ -548,6 +551,7 @@ impl Parser {
             }
         }
         Ok(Stmt::Declare {
+            polyphonic,
             kind,
             name,
             init,

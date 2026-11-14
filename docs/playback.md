@@ -31,8 +31,10 @@ Grades are the same three as in the format document: **[verified]** measured and
 
 ## 1. Velocity
 
-**1.1 Layer selection.** A zone covers a velocity range. The zone whose range contains the velocity
-plays; when two ranges abut, the neighbours are faded into each other rather than switched.
+**1.1 Layer selection.** A zone covers a velocity range. Overlap can be defined by the authored
+ranges, fade widths or script routing. Adjacent ranges alone do not establish a crossfade. A
+constant-carrier reference of Main Lite at velocity 80 selects the release recording covering
+60–80 without the additional, longer recording covering 81–100. [verified for this capture]
 
 **1.2 Crossfade laws.** Stored velocity-fade widths describe overlapping layers. Whether a
 particular preset uses linear, equal-power or another fade law requires isolated reference
@@ -59,18 +61,28 @@ sustain level, and the note stays there until it is released; then the release s
 sustain of 0 is a legal, deliberate "one-shot" envelope.
 
 **2.4 Curve shape.** The stored attack curve selects the shape of the attack segment rather than
-its length: −1 bends it one way, +1 the other, 0 is linear. The exact law is **[open]**; a power
-curve through the same endpoints is indistinguishable at the sample level for the libraries
-measured here.
+its length: −1 bends it one way, +1 the other, 0 is linear. The exact law is **[open]**.
+Constant-carrier measurements distinguish curve families that ordinary sampled material can
+conceal; sharing endpoints does not establish equivalence to a power curve.
 
 **2.5 Normalised knob values.** KSP exposes these times as 0…1 (`$ENGINE_PAR_ATTACK` and friends)
 and panels display them in milliseconds. One observed preset pairs a 500 ms decay with a saved
 controller value of 586069. This single correspondence does not determine the native conversion
 curve or its limits. [open]
 
-**2.6 Release.** On note-off the level falls from wherever it is to zero over the stored release
-time; it does not jump to the sustain level first. A release that is longer than the remaining
-sample is cut short by the sample, not extended.
+**2.6 Release.** On note-off the level falls from its current level; it does not jump to the
+sustain level first. Controller routes can change the effective duration from the stored base
+value. A release longer than the remaining sample is cut short by the sample, not extended.
+
+**2.7 Controlled carrier capture.** Main Lite was measured with fixed-amplitude sine samples,
+separate frequencies for the two microphones and separate markers for release-trigger samples.
+At MIDI note 69, velocity 80, CC84 changes the attack and CC72 changes the main-note release.
+For CC values 0, 32, 64, 96 and 127, the first microphone's main tone reaches 20 dB below its held
+level approximately within 20, 21, 34, 64 and 149 ms of note-off. The carrier extraction uses a
+30 Hz low-pass, so the shortest times are resolution-limited, not exact envelope parameter
+readouts. Release-trigger markers have their own attack and level response and must be measured
+separately from the main note. These observations constrain the preset's response but do not
+establish a universal parameter conversion or envelope formula. [verified capture / open law]
 
 ## 3. Pitch and playback rate
 
@@ -103,6 +115,14 @@ sat at 0.019. [verified]
 **4.2 Chokes.** A script stopping another note uses `fade_out(event_id, time_µs, relative)`. The
 time is in **microseconds**, so a 70 ms overlap on a snare roll reads `70000`. A choke that is
 applied to the wrong event id either does nothing or cuts the wrong note.
+
+**4.3 Damper pedal and key release.** In normal sustain-pedal mode, CC64 values 64–127
+keep a released main note sounding; values 0–63 let its amplitude envelope enter release.
+Notes whose keys remain held are not released by lifting the pedal. The physical Note Off still
+invokes `on release`; pedal-up is a controller event, not a second key release. Recorded pedal
+noise can therefore be triggered independently by `on controller`. Continuous half-pedal damping
+and repedalling depend on the instrument and must not be inferred from the binary threshold alone.
+See the KSP [callback reference](https://docs.native-instruments.com/ni-tech-manuals/ksp-manual/en/callbacks).
 
 ## 5. Gain staging
 
