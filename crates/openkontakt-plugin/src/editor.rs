@@ -29,6 +29,17 @@ const CONTENT_TOP: f32 = HEADER_HEIGHT + GLOBAL_ROW_HEIGHT;
 const INSTRUMENT_HEADER_HEIGHT: f32 = 62.0;
 const KEYBOARD_HEIGHT: f32 = 104.0;
 
+/// Wordmark geometry. The file menu takes its width from the same measurement, so the two stay
+/// aligned if the font or size changes.
+const LOGO_TEXT: &str = "OPENKONTAKT";
+const LOGO_TEXT_X: f32 = 18.0;
+const LOGO_TEXT_SIZE: f32 = 20.0;
+const LOGO_CENTER_Y: f32 = 25.0;
+const CHEVRON_GAP: f32 = 9.0;
+const CHEVRON_HALF_WIDTH: f32 = 7.0;
+const CHEVRON_HALF_HEIGHT: f32 = 4.0;
+const LOGO_HIT_LEFT: f32 = 10.0;
+
 // OpenKontakt's palette: warm varnish against a near-black Kontakt-style chassis.
 const BG: Color32 = Color32::from_rgb(17, 17, 15);
 const PANEL: Color32 = Color32::from_rgb(25, 25, 22);
@@ -1032,6 +1043,21 @@ impl Painter<'_> {
     }
 }
 
+/// Right edge of the "OPENKONTAKT" text, in design pixels.
+fn logo_text_right(p: &Painter<'_>) -> f32 {
+    let galley = p.ui.painter().layout_no_wrap(
+        LOGO_TEXT.to_owned(),
+        FontId::new(p.s(LOGO_TEXT_SIZE), FontFamily::Proportional),
+        TEXT,
+    );
+    LOGO_TEXT_X + galley.size().x / p.scale
+}
+
+/// Right edge of the wordmark plus its chevron; the file menu is exactly this wide.
+fn logo_block_right(p: &Painter<'_>) -> f32 {
+    logo_text_right(p) + CHEVRON_GAP + CHEVRON_HALF_WIDTH * 2.0
+}
+
 impl OpenKontaktEditor {
     fn draw_header(&mut self, p: &Painter<'_>) {
         let painter = p.ui.painter();
@@ -1047,7 +1073,12 @@ impl OpenKontaktEditor {
             ],
             Stroke::new(1.0, LINE),
         );
-        let logo_rect = p.rect(10.0, 6.0, 242.0, 38.0);
+        // The logo text never highlights; only the chevron next to it does, both on hover and
+        // while the menu is open. Both sit right after the measured text width instead of at a
+        // guessed offset, so they stay next to the wordmark if the font or size changes.
+        let logo_hit_right = logo_block_right(p) + 10.0;
+        let chevron_x = logo_block_right(p) - CHEVRON_HALF_WIDTH;
+        let logo_rect = p.rect(LOGO_HIT_LEFT, 6.0, logo_hit_right - LOGO_HIT_LEFT, 38.0);
         let logo_response = p.ui.interact(
             logo_rect,
             p.ui.scope_id().with("openkontakt-logo-menu"),
@@ -1063,17 +1094,33 @@ impl OpenKontaktEditor {
         }
         p.text(
             painter,
-            18.0,
-            25.0,
-            "OPENKONTAKT",
-            20.0,
-            if self.show_file_menu {
-                ACCENT_SOFT
-            } else {
-                TEXT
-            },
+            LOGO_TEXT_X,
+            LOGO_CENTER_Y,
+            LOGO_TEXT,
+            LOGO_TEXT_SIZE,
+            TEXT,
             Align2::LEFT_CENTER,
         );
+        // A square-cornered V, stroked like the original: no fill, mitred apex.
+        let chevron_color = if logo_response.hovered() || self.show_file_menu {
+            TEXT
+        } else {
+            MUTED
+        };
+        painter.add(egui::Shape::line(
+            vec![
+                p.pos(
+                    chevron_x - CHEVRON_HALF_WIDTH,
+                    LOGO_CENTER_Y - CHEVRON_HALF_HEIGHT,
+                ),
+                p.pos(chevron_x, LOGO_CENTER_Y + CHEVRON_HALF_HEIGHT),
+                p.pos(
+                    chevron_x + CHEVRON_HALF_WIDTH,
+                    LOGO_CENTER_Y - CHEVRON_HALF_HEIGHT,
+                ),
+            ],
+            Stroke::new(p.s(2.0), chevron_color),
+        ));
         // The original uses two view icons: a play triangle for the instrument and a stack of
         // books for the library browser.
         for (view, x, id) in [
@@ -3486,7 +3533,7 @@ impl OpenKontaktEditor {
         );
         if enabled && response.hovered() {
             p.ui.painter()
-                .rect_filled(rect, p.s(2.0), Color32::from_rgb(64, 60, 52));
+                .rect_filled(rect, p.s(2.0), Color32::from_rgb(91, 91, 91));
             p.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         let color = if enabled { TEXT } else { DIM };
@@ -3529,9 +3576,21 @@ impl OpenKontaktEditor {
             }
         }
 
-        let menu = p.rect(12.0, HEADER_HEIGHT + 2.0, 292.0, 190.0);
+        // Five 26 px options, two 10 px separator gaps, 6 px padding top and bottom. The width
+        // matches the wordmark plus chevron above it.
+        const ROW_HEIGHT: f32 = 26.0;
+        const SEPARATOR: f32 = 10.0;
+        const PADDING: f32 = 6.0;
+        const MENU_X: f32 = 12.0;
+        let menu_width = logo_block_right(p) - MENU_X;
+        let menu = p.rect(
+            MENU_X,
+            HEADER_HEIGHT + 2.0,
+            menu_width,
+            PADDING * 2.0 + ROW_HEIGHT * 5.0 + SEPARATOR * 2.0,
+        );
         let painter = p.ui.painter().clone();
-        painter.rect_filled(menu, p.s(3.0), Color32::from_rgb(43, 43, 44));
+        painter.rect_filled(menu, p.s(3.0), Color32::from_rgb(60, 60, 60));
         painter.rect_stroke(
             menu,
             p.s(3.0),
@@ -3539,10 +3598,10 @@ impl OpenKontaktEditor {
             StrokeKind::Inside,
         );
 
-        let mut y = menu.min.y / p.scale - p.origin.y / p.scale + 6.0;
-        let row = |y: f32, height: f32| p.rect(18.0, y, 280.0, height);
+        let mut y = menu.min.y / p.scale - p.origin.y / p.scale + PADDING;
+        let row = |y: f32, height: f32| p.rect(MENU_X + 1.0, y, menu_width - 2.0, height);
 
-        let load_rect = row(y, 30.0);
+        let load_rect = row(y, ROW_HEIGHT);
         if self
             .menu_row(p, load_rect, "load", "Load…", Some("Cmd+O"), true)
             .clicked()
@@ -3550,9 +3609,9 @@ impl OpenKontaktEditor {
             self.open_file_dialog();
             return;
         }
-        y += 30.0;
+        y += ROW_HEIGHT;
 
-        let recent_rect = row(y, 30.0);
+        let recent_rect = row(y, ROW_HEIGHT);
         if self.recent_instruments.is_empty() {
             let current = self.params.path();
             if !current.is_empty() {
@@ -3571,17 +3630,20 @@ impl OpenKontaktEditor {
         if recent.clicked() && has_recent {
             self.show_recent_menu = !self.show_recent_menu;
         }
-        y += 30.0;
+        y += ROW_HEIGHT;
 
         painter.line_segment(
-            [p.pos(22.0, y + 4.0), p.pos(294.0, y + 4.0)],
+            [
+                p.pos(MENU_X + 10.0, y + 4.0),
+                p.pos(MENU_X + menu_width - 10.0, y + 4.0),
+            ],
             Stroke::new(1.0, Color32::from_rgb(76, 73, 67)),
         );
-        y += 10.0;
+        y += SEPARATOR;
 
         let current_path = self.params.path();
         let has_current = !current_path.is_empty();
-        let reload_rect = row(y, 30.0);
+        let reload_rect = row(y, ROW_HEIGHT);
         if self
             .menu_row(
                 p,
@@ -3597,9 +3659,9 @@ impl OpenKontaktEditor {
             self.load_path(PathBuf::from(current_path));
             return;
         }
-        y += 30.0;
+        y += ROW_HEIGHT;
 
-        let reset_rect = row(y, 30.0);
+        let reset_rect = row(y, ROW_HEIGHT);
         if self
             .menu_row(
                 p,
@@ -3618,26 +3680,30 @@ impl OpenKontaktEditor {
             self.file_menu_rect = None;
             return;
         }
-        y += 30.0;
+        y += ROW_HEIGHT;
 
         painter.line_segment(
-            [p.pos(22.0, y + 4.0), p.pos(294.0, y + 4.0)],
+            [
+                p.pos(MENU_X + 10.0, y + 4.0),
+                p.pos(MENU_X + menu_width - 10.0, y + 4.0),
+            ],
             Stroke::new(1.0, Color32::from_rgb(76, 73, 67)),
         );
-        y += 10.0;
+        y += SEPARATOR;
 
-        let options_rect = row(y, 30.0);
+        let options_rect = row(y, ROW_HEIGHT);
         self.menu_row(p, options_rect, "options", "Options…", Some("F12"), false);
 
         let mut total_rect = menu;
         if self.show_recent_menu && has_recent {
+            let submenu_x = MENU_X + menu_width + 6.0;
             let submenu = p.rect(
-                310.0,
+                submenu_x,
                 recent_rect.top() / p.scale - p.origin.y / p.scale,
                 380.0,
-                (self.recent_instruments.len().min(8) as f32 * 27.0) + 8.0,
+                (self.recent_instruments.len().min(8) as f32 * 24.0) + 8.0,
             );
-            painter.rect_filled(submenu, p.s(3.0), Color32::from_rgb(43, 43, 44));
+            painter.rect_filled(submenu, p.s(3.0), Color32::from_rgb(60, 60, 60));
             painter.rect_stroke(
                 submenu,
                 p.s(3.0),
@@ -3648,7 +3714,7 @@ impl OpenKontaktEditor {
             let mut item_y = submenu.min.y / p.scale - p.origin.y / p.scale + 4.0;
             let mut selected = None;
             for (index, path) in self.recent_instruments.iter().take(8).enumerate() {
-                let item = p.rect(316.0, item_y, 368.0, 27.0);
+                let item = p.rect(submenu_x + 1.0, item_y, 378.0, 24.0);
                 let name = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -3658,7 +3724,7 @@ impl OpenKontaktEditor {
                 if response.clicked() {
                     selected = Some(path.clone());
                 }
-                item_y += 27.0;
+                item_y += 24.0;
             }
             if let Some(path) = selected {
                 self.load_path(path);
